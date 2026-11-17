@@ -17,21 +17,13 @@
  */
 
 #include <sys/types.h>
-#include <sys/ioctl.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/un.h>
-#include <sys/wait.h>
 
 #include <errno.h>
 #include <fcntl.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <termios.h>
 #include <time.h>
-#include <unistd.h>
 
 #include "tmux.h"
 
@@ -48,6 +40,71 @@ static int		 server_exit;
 static struct event	 server_ev_accept;
 static struct event	 server_ev_tidy;
 
+#define MAX_PENDING_TTYS    16
+#define PENDING_TTY_EXPIRY  30
+
+struct pending_tty {
+	char			 token[65];
+	int			 fd;
+	time_t			 created;
+	TAILQ_ENTRY(pending_tty) entry;
+};
+static TAILQ_HEAD(, pending_tty) pending_ttys =
+    TAILQ_HEAD_INITIALIZER(pending_ttys);
+
+void
+server_add_pending_tty(const char *token, int fd)
+{
+	struct pending_tty	*pt, *pt_next;
+	time_t			 now;
+	u_int			 count = 0;
+
+	now = time(NULL);
+
+	TAILQ_FOREACH_SAFE(pt, &pending_ttys, entry, pt_next) {
+		if (now - pt->created >= PENDING_TTY_EXPIRY) {
+			log_debug("expiring pending tty: token=%s fd=%d",
+			    pt->token, pt->fd);
+			close(pt->fd);
+			TAILQ_REMOVE(&pending_ttys, pt, entry);
+			free(pt);
+		} else
+			count++;
+	}
+
+	if (count >= MAX_PENDING_TTYS) {
+		log_debug("pending tty queue full, rejecting fd=%d", fd);
+		close(fd);
+		return;
+	}
+
+	pt = xcalloc(1, sizeof *pt);
+	strlcpy(pt->token, token, sizeof pt->token);
+	pt->fd = fd;
+	pt->created = now;
+	TAILQ_INSERT_TAIL(&pending_ttys, pt, entry);
+	log_debug("added pending tty: token=%s fd=%d", token, fd);
+}
+
+int
+server_get_pending_tty(const char *token)
+{
+	struct pending_tty	*pt, *pt_next;
+	int			 fd;
+
+	TAILQ_FOREACH_SAFE(pt, &pending_ttys, entry, pt_next) {
+		if (strcmp(pt->token, token) == 0) {
+			fd = pt->fd;
+			TAILQ_REMOVE(&pending_ttys, pt, entry);
+			free(pt);
+			log_debug("matched pending tty: token=%s fd=%d",
+			    token, fd);
+			return (fd);
+		}
+	}
+	return (-1);
+}
+
 struct cmd_find_state	 marked_pane;
 
 static u_int		 message_next;
@@ -56,8 +113,91 @@ struct message_list	 message_log;
 time_t			 current_time;
 
 static int	server_loop(void);
+static void	server_stop_listening(void);
 static void	server_send_exit(void);
-static void	server_accept(int, short, void *);
+
+#define SERVER_LAUNCHER_ENV "TMUX_WIN32_LAUNCHER_PID"
+static pid_t		server_launcher_pid;
+static struct event	server_launcher_timer;
+
+static void
+server_launcher_timeout(__unused evutil_socket_t fd, __unused short events,
+    __unused void *data)
+{
+	log_debug("launching client %ld did not arrive",
+	    (long)server_launcher_pid);
+	server_launcher_pid = 0;
+}
+
+static void
+server_launcher_init(void)
+{
+	char		value[32];
+	struct timeval	tv = { .tv_sec = 10 };
+	DWORD		n;
+
+	n = GetEnvironmentVariableA(SERVER_LAUNCHER_ENV, value, sizeof value);
+	SetEnvironmentVariableA(SERVER_LAUNCHER_ENV, NULL);
+	environ_unset(global_environ, SERVER_LAUNCHER_ENV);
+	if (n == 0 || n >= sizeof value)
+		return;
+	server_launcher_pid = (pid_t)strtol(value, NULL, 10);
+	log_debug("waiting for launching client %ld",
+	    (long)server_launcher_pid);
+	evtimer_set(&server_launcher_timer, server_launcher_timeout, NULL);
+	evtimer_add(&server_launcher_timer, &tv);
+}
+
+void
+server_launcher_arrived(pid_t pid)
+{
+	if (server_launcher_pid == 0 || pid != server_launcher_pid)
+		return;
+	log_debug("launching client %ld arrived", (long)pid);
+	server_launcher_pid = 0;
+	evtimer_del(&server_launcher_timer);
+}
+
+struct server_pane_exit {
+	u_int	id;
+	pid_t	pid;
+};
+
+static void
+server_pane_exit_timer(__unused evutil_socket_t fd, __unused short events,
+    void *arg)
+{
+	struct server_pane_exit	*pe = arg;
+	struct window_pane	*wp;
+
+	wp = window_pane_find_by_id(pe->id);
+	if (wp != NULL && wp->pid == pe->pid && (~wp->flags & PANE_EXITED)) {
+		log_debug("%%%u output did not end; finishing", wp->id);
+		wp->flags |= PANE_EXITED;
+		if (window_pane_destroy_ready(wp))
+			server_destroy_pane(wp, 1);
+	}
+	free(pe);
+}
+
+static void
+server_pane_exit_later(struct window_pane *wp)
+{
+	struct server_pane_exit	*pe;
+	struct timeval		 tv = { .tv_sec = 2 };
+
+	if (wp->fd == -1) {
+		wp->flags |= PANE_EXITED;
+		if (window_pane_destroy_ready(wp))
+			server_destroy_pane(wp, 1);
+		return;
+	}
+	pe = xmalloc(sizeof *pe);
+	pe->id = wp->id;
+	pe->pid = wp->pid;
+	event_once(-1, EV_TIMEOUT, server_pane_exit_timer, pe, &tv);
+}
+static void	server_accept(evutil_socket_t, short, void *);
 static void	server_signal(int);
 static void	server_child_signal(void);
 static void	server_child_exited(pid_t, int);
@@ -106,66 +246,30 @@ server_check_marked(void)
 int
 server_create_socket(uint64_t flags, char **cause)
 {
-	struct sockaddr_un	sa;
-	size_t			size;
-	mode_t			mask;
-	int			fd, saved_errno;
+	int	fd;
 
-	memset(&sa, 0, sizeof sa);
-	sa.sun_family = AF_UNIX;
-	size = strlcpy(sa.sun_path, socket_path, sizeof sa.sun_path);
-	if (size >= sizeof sa.sun_path) {
-		errno = ENAMETOOLONG;
-		goto fail;
-	}
-	unlink(sa.sun_path);
-
-	if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1)
-		goto fail;
-
-	if (flags & CLIENT_DEFAULTSOCKET)
-		mask = umask(S_IXUSR|S_IXGRP|S_IRWXO);
-	else
-		mask = umask(S_IXUSR|S_IRWXG|S_IRWXO);
-	if (bind(fd, (struct sockaddr *)&sa, sizeof sa) == -1) {
-		saved_errno = errno;
-		umask(mask);
-		close(fd);
-		errno = saved_errno;
-		goto fail;
-	}
-	umask(mask);
-
-	if (listen(fd, 128) == -1) {
-		saved_errno = errno;
-		close(fd);
-		errno = saved_errno;
-		goto fail;
+	(void)flags;
+	fd = win32_ipc_create_server(socket_path);
+	if (fd == -1) {
+		if (cause != NULL)
+			xasprintf(cause, "error creating %s (%s)", socket_path,
+			    strerror(errno));
+		return (-1);
 	}
 	setblocking(fd, 0);
-
+	win32_signal_events();
 	return (fd);
-
-fail:
-	if (cause != NULL) {
-		xasprintf(cause, "error creating %s (%s)", socket_path,
-		    strerror(errno));
-	}
-	return (-1);
 }
 
 /* Tidy up every hour. */
 static void
-server_tidy_event(__unused int fd, __unused short events, __unused void *data)
+server_tidy_event(__unused evutil_socket_t fd, __unused short events,
+    __unused void *data)
 {
     struct timeval	tv = { .tv_sec = 3600 };
     uint64_t		t = get_timer();
 
     format_tidy_jobs();
-
-#ifdef HAVE_MALLOC_TRIM
-    malloc_trim(0);
-#endif
 
     log_debug("%s: took %llu milliseconds", __func__,
         (unsigned long long)(get_timer() - t));
@@ -178,17 +282,12 @@ server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
     int lockfd, char *lockfile)
 {
 	int		 fd;
-	sigset_t	 set, oldset;
 	struct client	*c = NULL;
 	char		*cause = NULL;
 	struct timeval	 tv = { .tv_sec = 3600 };
 
-	sigfillset(&set);
-	sigprocmask(SIG_BLOCK, &set, &oldset);
-
 	if (~flags & CLIENT_NOFORK) {
 		if (proc_fork_and_daemon(&fd) != 0) {
-			sigprocmask(SIG_SETMASK, &oldset, NULL);
 			return (fd);
 		}
 	}
@@ -200,7 +299,6 @@ server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
 	server_proc = proc_start("server");
 
 	proc_set_signals(server_proc, server_signal);
-	sigprocmask(SIG_SETMASK, &oldset, NULL);
 
 	if (log_get_level() > 1)
 		tty_create_log();
@@ -220,21 +318,11 @@ server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
 	TAILQ_INIT(&message_log);
 	gettimeofday(&start_time, NULL);
 
-#ifdef HAVE_KEYCTL
-	fork_session_keyring();
-#endif
-
-#ifdef HAVE_SYSTEMD
-	server_fd = systemd_create_socket(flags, &cause);
-#else
 	server_fd = server_create_socket(flags, &cause);
-#endif
 	if (server_fd != -1)
 		server_update_socket();
 	if (~flags & CLIENT_NOFORK)
 		c = server_client_create(fd);
-	else
-		options_set_number(global_options, "exit-empty", 0);
 
 	if (lockfd >= 0) {
 		unlink(lockfile);
@@ -259,8 +347,10 @@ server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
 	server_acl_init();
 
 	server_add_accept(0);
+	server_launcher_init();
 	proc_loop(server_proc, server_loop);
 
+	server_stop_listening();
 	job_kill_all();
 	prompt_save_history();
 
@@ -290,6 +380,8 @@ server_loop(void)
 
 	if (!options_get_number(global_options, "exit-empty") && !server_exit)
 		return (0);
+	if (server_launcher_pid != 0 && !server_exit)
+		return (0);
 
 	if (!options_get_number(global_options, "exit-unattached")) {
 		if (!RB_EMPTY(&sessions))
@@ -311,8 +403,19 @@ server_loop(void)
 
 	if (job_still_running())
 		return (0);
-
 	return (1);
+}
+
+static void
+server_stop_listening(void)
+{
+	if (event_initialized(&server_ev_accept))
+		event_del(&server_ev_accept);
+	if (server_fd != -1) {
+		closesocket((SOCKET)server_fd);
+		server_fd = -1;
+	}
+	win32_ipc_cleanup(socket_path);
 }
 
 /* Exit the server by killing all clients and windows. */
@@ -322,6 +425,7 @@ server_send_exit(void)
 	struct client	*c, *c1;
 	struct session	*s, *s1;
 
+	server_stop_listening();
 	cmd_wait_for_flush();
 
 	TAILQ_FOREACH_SAFE(c, &clients, entry, c1) {
@@ -342,41 +446,11 @@ server_send_exit(void)
 void
 server_update_socket(void)
 {
-	struct session	*s;
-	static int	 last = -1;
-	int		 n, mode;
-	struct stat      sb;
-
-	n = 0;
-	RB_FOREACH(s, sessions, &sessions) {
-		if (s->attached != 0) {
-			n++;
-			break;
-		}
-	}
-
-	if (n != last) {
-		last = n;
-
-		if (stat(socket_path, &sb) != 0)
-			return;
-		mode = sb.st_mode & ACCESSPERMS;
-		if (n != 0) {
-			if (mode & S_IRUSR)
-				mode |= S_IXUSR;
-			if (mode & S_IRGRP)
-				mode |= S_IXGRP;
-			if (mode & S_IROTH)
-				mode |= S_IXOTH;
-		} else
-			mode &= ~(S_IXUSR|S_IXGRP|S_IXOTH);
-		chmod(socket_path, mode);
-	}
 }
 
 /* Callback for server socket. */
 static void
-server_accept(int fd, short events, __unused void *data)
+server_accept(evutil_socket_t fd, short events, __unused void *data)
 {
 	struct sockaddr_storage	 sa;
 	socklen_t		 slen = sizeof sa;
@@ -399,8 +473,69 @@ server_accept(int fd, short events, __unused void *data)
 		fatal("accept failed");
 	}
 
+	{
+		char tty_token[65] = {0};
+		int auth_result;
+
+		auth_result = win32_ipc_verify_auth(newfd, socket_path,
+		    tty_token, sizeof tty_token);
+		if (auth_result == -1) {
+			closesocket((SOCKET)newfd);
+			return;
+		}
+		if (auth_result == 1) {
+			struct client *tc;
+			TAILQ_FOREACH(tc, &clients, entry) {
+				if (tc->tty_token != NULL &&
+				    strcmp(tc->tty_token, tty_token) == 0) {
+					tc->fd = newfd;
+					log_debug("matched tty fd %d for "
+					    "client %p", newfd, tc);
+					free(tc->tty_token);
+					tc->tty_token = NULL;
+					if ((tc->flags & CLIENT_IDENTIFIED) &&
+					    (tc->flags & CLIENT_CONTROL) &&
+					    tc->control_state == NULL)
+						control_start(tc);
+					if ((tc->flags & CLIENT_IDENTIFIED) &&
+					    !(tc->flags &
+					    (CLIENT_TERMINAL|CLIENT_CONTROL))) {
+						u_int sx = tc->tty.sx;
+						u_int sy = tc->tty.sy;
+						if (tty_init(&tc->tty, tc) == 0) {
+							if (sx == 0)
+								sx = 80;
+							if (sy == 0)
+								sy = 24;
+							tty_set_size(&tc->tty,
+							    sx, sy, 0, 0);
+							tc->flags |= CLIENT_TERMINAL;
+							recalculate_sizes();
+							server_redraw_client(tc);
+						}
+					}
+					if (tc->flags & CLIENT_IDENTIFIED) {
+						if (event_initialized(
+						    &tc->tty_wait_timer))
+							evtimer_del(
+							    &tc->tty_wait_timer);
+						if (tc->tty_wait_item != NULL) {
+							cmdq_continue(
+							    tc->tty_wait_item);
+							tc->tty_wait_item = NULL;
+						}
+					}
+					server_add_accept(0);
+					return;
+				}
+			}
+			server_add_pending_tty(tty_token, newfd);
+			return;
+		}
+	}
+
 	if (server_exit) {
-		close(newfd);
+		closesocket((SOCKET)newfd);
 		return;
 	}
 	c = server_client_create(newfd);
@@ -454,14 +589,10 @@ server_signal(int sig)
 		server_child_signal();
 		break;
 	case SIGUSR1:
-#ifdef HAVE_SYSTEMD
-		if (systemd_activated())
-			break;
-#endif
 		event_del(&server_ev_accept);
 		fd = server_create_socket(server_client_flags, NULL);
 		if (fd != -1) {
-			close(server_fd);
+			closesocket((SOCKET)server_fd);
 			server_fd = fd;
 			server_update_socket();
 		}
@@ -469,6 +600,8 @@ server_signal(int sig)
 		break;
 	case SIGUSR2:
 		proc_toggle_log(server_proc);
+		break;
+	case SIGWINCH:
 		break;
 	}
 }
@@ -485,7 +618,7 @@ server_child_signal(void)
 		case -1:
 			if (errno == ECHILD)
 				return;
-			fatal("waitpid failed");
+			return;
 		case 0:
 			return;
 		}
@@ -510,6 +643,8 @@ server_child_exited(pid_t pid, int status)
 				wp->flags |= PANE_STATUSREADY;
 
 				log_debug("%%%u exited", wp->id);
+				server_pane_exit_later(wp);
+				break;
 				wp->flags |= PANE_EXITED;
 
 				window_pane_wait_finish(wp);

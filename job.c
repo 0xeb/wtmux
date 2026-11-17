@@ -17,17 +17,13 @@
  */
 
 #include <sys/types.h>
-#include <sys/ioctl.h>
-#include <sys/socket.h>
-#include <sys/wait.h>
 
 #include <fcntl.h>
-#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "tmux.h"
+#include "platform/tmux-platform.h"
 
 /*
  * Job scheduling. Run queued commands in the background and record their
@@ -55,6 +51,7 @@ struct job {
 
 	int			 fd;
 	struct bufferevent	*event;
+	struct win32_pty	*native_pty;
 
 	job_update_cb		 updatecb;
 	job_complete_cb		 completecb;
@@ -77,12 +74,11 @@ job_run(const char *cmd, int argc, char **argv, struct environ *e,
 	struct job	 *job;
 	struct environ	 *env;
 	pid_t		  pid;
-	int		  nullfd, out[2], master, do_close = 1;
-	const char	 *home, *shell;
-	sigset_t	  set, oldset;
-	struct winsize	  ws;
-	char		**argvp, tty[TTY_NAME_MAX], *argv0;
+	int		  out[2];
+	const char	 *shell;
+	char		 *cmdline, *argv0, *envblock, **native_argv;
 	struct options	 *oo;
+	struct win32_pty *pty = NULL;
 
 	/*
 	 * Do not set TERM during .tmux.conf (second argument here), it is nice
@@ -93,6 +89,7 @@ job_run(const char *cmd, int argc, char **argv, struct environ *e,
 	if (e != NULL)
 		environ_copy(e, env);
 
+	flags |= JOB_DEFAULTSHELL;
 	if (~flags & JOB_DEFAULTSHELL)
 		shell = _PATH_BSHELL;
 	else {
@@ -106,19 +103,6 @@ job_run(const char *cmd, int argc, char **argv, struct environ *e,
 	}
 	argv0 = shell_argv0(shell, 0);
 
-	sigfillset(&set);
-	sigprocmask(SIG_BLOCK, &set, &oldset);
-
-	if (flags & JOB_PTY) {
-		memset(&ws, 0, sizeof ws);
-		ws.ws_col = sx;
-		ws.ws_row = sy;
-		pid = fdforkpty(ptm_fd, &master, tty, NULL, &ws);
-	} else {
-		if (socketpair(AF_UNIX, SOCK_STREAM, PF_UNSPEC, out) != 0)
-			goto fail;
-		pid = fork();
-	}
 	if (cmd == NULL) {
 		cmd_log_argv(argc, argv, "%s:", __func__);
 		log_debug("%s: cwd=%s, shell=%s", __func__,
@@ -128,70 +112,32 @@ job_run(const char *cmd, int argc, char **argv, struct environ *e,
 		    cwd == NULL ? "" : cwd, shell);
 	}
 
-	switch (pid) {
-	case -1:
-		if (~flags & JOB_PTY) {
-			close(out[0]);
-			close(out[1]);
-		}
-		goto fail;
-	case 0:
-		proc_clear_signals(server_proc, 1);
-		sigprocmask(SIG_SETMASK, &oldset, NULL);
-
-		if (cwd != NULL) {
-			if (chdir(cwd) == 0)
-				environ_set(env, "PWD", 0, "%s", cwd);
-			else if ((home = find_home()) != NULL && chdir(home) == 0)
-				environ_set(env, "PWD", 0, "%s", home);
-			else if (chdir("/") == 0)
-				environ_set(env, "PWD", 0, "/");
-			else
-				_exit(1);
-		}
-
-		environ_push(env);
-		environ_free(env);
-
-		if (~flags & JOB_PTY) {
-			if (dup2(out[1], STDIN_FILENO) == -1)
-				_exit(1);
-			do_close = do_close && out[1] != STDIN_FILENO;
-			if (dup2(out[1], STDOUT_FILENO) == -1)
-				_exit(1);
-			do_close = do_close && out[1] != STDOUT_FILENO;
-			if (flags & JOB_SHOWSTDERR) {
-				if (dup2(out[1], STDERR_FILENO) == -1)
-					_exit(1);
-				do_close = do_close && out[1] != STDERR_FILENO;
-			} else {
-				nullfd = open(_PATH_DEVNULL, O_RDWR);
-				if (nullfd == -1)
-					_exit(1);
-				if (dup2(nullfd, STDERR_FILENO) == -1)
-					_exit(1);
-				if (nullfd != STDERR_FILENO)
-					close(nullfd);
-			}
-			if (do_close)
-				close(out[1]);
-			close(out[0]);
-		}
-		closefrom(STDERR_FILENO + 1);
-
-		if (cmd != NULL) {
-			if (flags & JOB_DEFAULTSHELL)
-				setenv("SHELL", shell, 1);
-			execl(shell, argv0, "-c", cmd, (char *)NULL);
-			_exit(1);
-		} else {
-			argvp = cmd_copy_argv(argc, argv);
-			execvp(argvp[0], argvp);
-			_exit(1);
-		}
+	if (cmd != NULL) {
+		environ_set(env, "SHELL", 0, "%s", shell);
+		cmdline = tmux_windows_shell_command(shell, cmd);
+	} else {
+		native_argv = cmd_copy_argv(argc, argv);
+		cmdline = tmux_windows_program_command_line(
+		    (const char *const *)native_argv);
+		cmd_free_argv(argc, native_argv);
 	}
+	if (cmdline == NULL)
+		goto fail;
+	envblock = environ_to_win32_block(env);
+	if (envblock == NULL) {
+		free(cmdline);
+		goto fail;
+	}
+	if (flags & JOB_PTY)
+		pty = win32_pty_spawn(cmdline, cwd, envblock, sx, sy, CP_UTF8,
+		    &pid);
+	else
+		pty = win32_pipe_spawn(cmdline, cwd, envblock, &pid);
+	free(envblock);
+	free(cmdline);
+	if (pty == NULL)
+		goto fail;
 
-	sigprocmask(SIG_SETMASK, &oldset, NULL);
 	environ_free(env);
 	free(argv0);
 
@@ -204,9 +150,9 @@ job_run(const char *cmd, int argc, char **argv, struct environ *e,
 	else
 		job->cmd = cmd_stringify_argv(argc, argv);
 	job->pid = pid;
-	if (flags & JOB_PTY)
-		strlcpy(job->tty, tty, sizeof job->tty);
 	job->status = 0;
+	job->native_pty = pty;
+	win32_process_watch(win32_pty_get_process(pty), pid);
 
 	LIST_INSERT_HEAD(&all_jobs, job, entry);
 
@@ -215,11 +161,7 @@ job_run(const char *cmd, int argc, char **argv, struct environ *e,
 	job->freecb = freecb;
 	job->data = data;
 
-	if (~flags & JOB_PTY) {
-		close(out[1]);
-		job->fd = out[0];
-	} else
-		job->fd = master;
+	job->fd = win32_pty_get_fd(pty);
 	setblocking(job->fd, 0);
 
 	job->event = bufferevent_new(job->fd, job_read_callback,
@@ -232,7 +174,6 @@ job_run(const char *cmd, int argc, char **argv, struct environ *e,
 	return (job);
 
 fail:
-	sigprocmask(SIG_SETMASK, &oldset, NULL);
 	environ_free(env);
 	free(argv0);
 	return (NULL);
@@ -280,8 +221,10 @@ job_free(struct job *job)
 		kill(job->pid, SIGTERM);
 	if (job->event != NULL)
 		bufferevent_free(job->event);
-	if (job->fd != -1)
-		close(job->fd);
+	if (job->native_pty != NULL)
+		win32_pty_close(job->native_pty);
+	else if (job->fd != -1)
+		closesocket((SOCKET)job->fd);
 
 	free(job);
 }
@@ -290,18 +233,14 @@ job_free(struct job *job)
 void
 job_resize(struct job *job, u_int sx, u_int sy)
 {
-	struct winsize	 ws;
 
 	if (job->fd == -1 || (~job->flags & JOB_PTY))
 		return;
 
 	log_debug("resize job %p: %ux%u", job, sx, sy);
 
-	memset(&ws, 0, sizeof ws);
-	ws.ws_col = sx;
-	ws.ws_row = sy;
-	if (ioctl(job->fd, TIOCSWINSZ, &ws) == -1)
-		fatal("ioctl failed");
+	if (job->native_pty != NULL)
+		win32_pty_resize(job->native_pty, (int)sx, (int)sy);
 }
 
 /* Job buffer read callback. */

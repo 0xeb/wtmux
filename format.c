@@ -17,20 +17,15 @@
  */
 
 #include <sys/types.h>
-#include <sys/wait.h>
 
 #include <ctype.h>
 #include <errno.h>
-#include <fnmatch.h>
-#include <libgen.h>
 #include <math.h>
-#include <pwd.h>
 #include <regex.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
 
 #include "tmux.h"
 
@@ -490,18 +485,11 @@ format_job_tidy(struct format_job_tree *jobs, int force)
 }
 
 /* Work around needless -Wformat-nonliteral gcc warning. */
-#ifdef __GNUC__
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wformat-nonliteral"
-#endif
 static size_t
 format_strftime(char *s, size_t max, const char *fmt, const struct tm *tm)
 {
 	return (strftime(s, max, fmt, tm));
 }
-#ifdef __GNUC__
-#pragma GCC diagnostic pop
-#endif
 
 /* Tidy old jobs for all clients. */
 void
@@ -6122,7 +6110,8 @@ fail:
 
 /* Callback for the cycle timer; redraw the status line. */
 static void
-format_cycle_callback(__unused int fd, __unused short events, void *arg)
+format_cycle_callback(__unused evutil_socket_t fd, __unused short events,
+    void *arg)
 {
 	struct client	*c = arg;
 

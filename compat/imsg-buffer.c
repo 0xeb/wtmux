@@ -18,16 +18,14 @@
  */
 
 #include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/uio.h>
-#include <arpa/inet.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 
 #include <limits.h>
 #include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "compat.h"
 #include "imsg.h"
@@ -724,102 +722,58 @@ msgbuf_concat(struct msgbuf *msgbuf, struct ibufqueue *from)
 int
 ibuf_write(int fd, struct msgbuf *msgbuf)
 {
-	struct iovec	 iov[IOV_MAX];
 	struct ibuf	*buf;
-	unsigned int	 i = 0;
-	ssize_t	n;
+	ssize_t		 n;
+	size_t		 total = 0;
 
-	memset(&iov, 0, sizeof(iov));
 	TAILQ_FOREACH(buf, &msgbuf->bufs.bufs, entry) {
-		if (i >= IOV_MAX)
-			break;
-		iov[i].iov_base = ibuf_data(buf);
-		iov[i].iov_len = ibuf_size(buf);
-		i++;
+ again:
+		if ((n = send(fd, ibuf_data(buf), ibuf_size(buf), 0)) == -1) {
+			int wsa_err = WSAGetLastError();
+			if (wsa_err == WSAEINTR)
+				goto again;
+			if (wsa_err == WSAEWOULDBLOCK || wsa_err == WSAENOBUFS) {
+				if (total > 0)
+					break;
+				return (0);
+			}
+			return (-1);
+		}
+		total += n;
 	}
-	if (i == 0)
+	if (total == 0)
 		return (0);	/* nothing queued */
 
- again:
-	if ((n = writev(fd, iov, i)) == -1) {
-		if (errno == EINTR)
-			goto again;
-		if (errno == EAGAIN || errno == ENOBUFS)
-			/* lets retry later again */
-			return (0);
-		return (-1);
-	}
-
-	msgbuf_drain(msgbuf, n);
+	msgbuf_drain(msgbuf, total);
 	return (0);
 }
 
 int
 msgbuf_write(int fd, struct msgbuf *msgbuf)
 {
-	struct iovec	 iov[IOV_MAX];
-	struct ibuf	*buf, *buf0 = NULL;
-	unsigned int	 i = 0;
+	struct ibuf	*buf;
 	ssize_t		 n;
-	struct msghdr	 msg;
-	struct cmsghdr	*cmsg;
-	union {
-		struct cmsghdr	hdr;
-		char		buf[CMSG_SPACE(sizeof(int))];
-	} cmsgbuf;
+	size_t		 total = 0;
 
-	memset(&iov, 0, sizeof(iov));
-	memset(&msg, 0, sizeof(msg));
-	memset(&cmsgbuf, 0, sizeof(cmsgbuf));
 	TAILQ_FOREACH(buf, &msgbuf->bufs.bufs, entry) {
-		if (i >= IOV_MAX)
-			break;
-		if (i > 0 && buf->fd != -1)
-			break;
-		iov[i].iov_base = ibuf_data(buf);
-		iov[i].iov_len = ibuf_size(buf);
-		i++;
-		if (buf->fd != -1)
-			buf0 = buf;
+ again:
+		if ((n = send(fd, ibuf_data(buf), ibuf_size(buf), 0)) == -1) {
+			int wsa_err = WSAGetLastError();
+			if (wsa_err == WSAEINTR)
+				goto again;
+			if (wsa_err == WSAEWOULDBLOCK || wsa_err == WSAENOBUFS) {
+				if (total > 0)
+					break;
+				return (0);
+			}
+			return (-1);
+		}
+		total += n;
 	}
-
-	if (i == 0)
+	if (total == 0)
 		return (0);	/* nothing queued */
 
-	msg.msg_iov = iov;
-	msg.msg_iovlen = i;
-
-	if (buf0 != NULL) {
-		msg.msg_control = (caddr_t)&cmsgbuf.buf;
-		msg.msg_controllen = sizeof(cmsgbuf.buf);
-		cmsg = CMSG_FIRSTHDR(&msg);
-		cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-		cmsg->cmsg_level = SOL_SOCKET;
-		cmsg->cmsg_type = SCM_RIGHTS;
-		*(int *)CMSG_DATA(cmsg) = buf0->fd;
-	}
-
- again:
-	if ((n = sendmsg(fd, &msg, 0)) == -1) {
-		if (errno == EINTR)
-			goto again;
-		if (errno == EAGAIN || errno == ENOBUFS)
-			/* lets retry later again */
-			return (0);
-		return (-1);
-	}
-
-	/*
-	 * assumption: fd got sent if sendmsg sent anything
-	 * this works because fds are passed one at a time
-	 */
-	if (buf0 != NULL) {
-		close(buf0->fd);
-		buf0->fd = -1;
-	}
-
-	msgbuf_drain(msgbuf, n);
-
+	msgbuf_drain(msgbuf, total);
 	return (0);
 }
 
@@ -877,7 +831,6 @@ ibuf_read_process(struct msgbuf *msgbuf, int fd)
 int
 ibuf_read(int fd, struct msgbuf *msgbuf)
 {
-	struct iovec	iov;
 	ssize_t		n;
 
 	if (msgbuf->rbuf == NULL) {
@@ -885,14 +838,13 @@ ibuf_read(int fd, struct msgbuf *msgbuf)
 		return (-1);
 	}
 
-	iov.iov_base = msgbuf->rbuf + msgbuf->roff;
-	iov.iov_len = IBUF_READ_SIZE - msgbuf->roff;
-
  again:
-	if ((n = readv(fd, &iov, 1)) == -1) {
-		if (errno == EINTR)
+	if ((n = recv(fd, msgbuf->rbuf + msgbuf->roff,
+	    IBUF_READ_SIZE - msgbuf->roff, 0)) == -1) {
+		int wsa_err = WSAGetLastError();
+		if (wsa_err == WSAEINTR)
 			goto again;
-		if (errno == EAGAIN)
+		if (wsa_err == WSAEWOULDBLOCK)
 			/* lets retry later again */
 			return (1);
 		return (-1);
@@ -908,43 +860,20 @@ ibuf_read(int fd, struct msgbuf *msgbuf)
 int
 msgbuf_read(int fd, struct msgbuf *msgbuf)
 {
-	struct msghdr		 msg;
-	struct cmsghdr		*cmsg;
-	union {
-		struct cmsghdr hdr;
-		char	buf[CMSG_SPACE(sizeof(int) * 1)];
-	} cmsgbuf;
-	struct iovec		 iov;
 	ssize_t			 n;
-	int			 fdpass = -1;
 
 	if (msgbuf->rbuf == NULL) {
 		errno = EINVAL;
 		return (-1);
 	}
 
-	memset(&msg, 0, sizeof(msg));
-	memset(&cmsgbuf, 0, sizeof(cmsgbuf));
-
-	iov.iov_base = msgbuf->rbuf + msgbuf->roff;
-	iov.iov_len = IBUF_READ_SIZE - msgbuf->roff;
-	msg.msg_iov = &iov;
-	msg.msg_iovlen = 1;
-	msg.msg_control = &cmsgbuf.buf;
-	msg.msg_controllen = sizeof(cmsgbuf.buf);
-
 again:
-	if ((n = recvmsg(fd, &msg, 0)) == -1) {
-		if (errno == EINTR)
+	if ((n = recv(fd, msgbuf->rbuf + msgbuf->roff,
+	    IBUF_READ_SIZE - msgbuf->roff, 0)) == -1) {
+		int wsa_err = WSAGetLastError();
+		if (wsa_err == WSAEINTR)
 			goto again;
-		if (errno == EMSGSIZE)
-			/*
-			 * Not enough fd slots: fd passing failed, retry
-			 * to receive the message without fd.
-			 * imsg_get_fd() will return -1 in that case.
-			 */
-			goto again;
-		if (errno == EAGAIN)
+		if (wsa_err == WSAEWOULDBLOCK)
 			/* lets retry later again */
 			return (1);
 		return (-1);
@@ -954,32 +883,7 @@ again:
 
 	msgbuf->roff += n;
 
-	for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL;
-	    cmsg = CMSG_NXTHDR(&msg, cmsg)) {
-		if (cmsg->cmsg_level == SOL_SOCKET &&
-		    cmsg->cmsg_type == SCM_RIGHTS) {
-			int i, j, f;
-
-			/*
-			 * We only accept one file descriptor.  Due to C
-			 * padding rules, our control buffer might contain
-			 * more than one fd, and we must close them.
-			 */
-			j = ((char *)cmsg + cmsg->cmsg_len -
-			    (char *)CMSG_DATA(cmsg)) / sizeof(int);
-			for (i = 0; i < j; i++) {
-				f = ((int *)CMSG_DATA(cmsg))[i];
-				if (i == 0)
-					fdpass = f;
-				else
-					close(f);
-			}
-		}
-		/* we do not handle other ctl data level */
-	}
-
-	/* new data arrived, try to process it */
-	return (ibuf_read_process(msgbuf, fdpass));
+	return (ibuf_read_process(msgbuf, -1));
 }
 
 static void

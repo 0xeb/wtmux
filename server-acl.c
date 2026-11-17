@@ -19,14 +19,10 @@
 
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/socket.h>
 
 #include <ctype.h>
-#include <grp.h>
-#include <pwd.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "tmux.h"
 
@@ -107,6 +103,24 @@ server_acl_update(void)
 	}
 }
 
+static void
+server_acl_update_pipe(void)
+{
+	struct server_acl_entry	*entry;
+	uid_t			*uids = NULL;
+	u_int			 n = 0;
+
+	RB_FOREACH(entry, server_acl_entries, &server_acl_entries) {
+		if ((entry->flags & SERVER_ACL_IS_GROUP) || entry->id == 0 ||
+		    entry->id == getuid())
+			continue;
+		uids = xreallocarray(uids, n + 1, sizeof *uids);
+		uids[n++] = entry->id;
+	}
+	win32_ipc_set_users(uids, n);
+	free(uids);
+}
+
 /* Initialize ACL tree. */
 void
 server_acl_init(void)
@@ -170,6 +184,7 @@ server_acl_allow(id_t id, int flags)
 		entry->id = id;
 		entry->flags = flags & SERVER_ACL_IS_GROUP;
 		RB_INSERT(server_acl_entries, &server_acl_entries, entry);
+		server_acl_update_pipe();
 	}
 }
 
@@ -183,6 +198,7 @@ server_acl_deny(id_t id, int flags)
 	if (entry != NULL) {
 		RB_REMOVE(server_acl_entries, &server_acl_entries, entry);
 		free(entry);
+		server_acl_update_pipe();
 		server_acl_update();
 	}
 }

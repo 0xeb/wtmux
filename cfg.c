@@ -144,6 +144,15 @@ load_cfg(const char *path, struct client *c, struct cmdq_item *item,
 	pi.item = item;
 	pi.c = c;
 
+	{
+		int	b0 = fgetc(f), b1, b2;
+
+		if (b0 == 0xef && (b1 = fgetc(f)) == 0xbb &&
+		    (b2 = fgetc(f)) == 0xbf)
+			;
+		else
+			rewind(f);
+	}
 	pr = cmd_parse_from_file(f, &pi);
 	fclose(f);
 	if (pr->status == CMD_PARSE_ERROR) {
@@ -197,6 +206,10 @@ load_cfg_from_buffer(const void *buf, size_t len, const char *path,
 	pi.item = item;
 	pi.c = c;
 
+	if (len >= 3 && memcmp(buf, "\357\273\277", 3) == 0) {
+		buf = (const char *)buf + 3;
+		len -= 3;
+	}
 	pr = cmd_parse_from_buffer(buf, len, &pi);
 	if (pr->status == CMD_PARSE_ERROR) {
 		cfg_add_cause("%s", pr->error);

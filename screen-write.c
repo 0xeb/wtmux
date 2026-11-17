@@ -82,7 +82,8 @@ screen_write_free_citem(struct screen_write_citem *ci)
 }
 
 static void
-screen_write_offset_timer(__unused int fd, __unused short events, void *data)
+screen_write_offset_timer(__unused evutil_socket_t fd, __unused short events,
+    void *data)
 {
 	struct window	*w = data;
 
@@ -320,6 +321,15 @@ static int
 screen_write_should_draw_line(struct screen_write_ctx *ctx, u_int y)
 {
 	return (screen_write_should_draw_lines(ctx, y, 1));
+}
+
+int
+screen_write_sync_defer(struct screen_write_ctx *ctx, u_int y, u_int ny)
+{
+	if (~ctx->s->mode & MODE_SYNC)
+		return (0);
+	screen_write_should_draw_lines(ctx, y, ny);
+	return (1);
 }
 
 /* Set up context for TTY command. */
@@ -1092,7 +1102,8 @@ screen_write_mode_clear(struct screen_write_ctx *ctx, int mode)
 
 /* Sync timeout callback. */
 static void
-screen_write_sync_callback(__unused int fd, __unused short events, void *arg)
+screen_write_sync_callback(__unused evutil_socket_t fd, __unused short events,
+    void *arg)
 {
 	struct window_pane	*wp = arg;
 
@@ -1379,6 +1390,10 @@ screen_write_sync_flush_dirty(struct window_pane *wp)
 	struct tty_ctx		 ttyctx;
 	struct screen		*s = &wp->base;
 	u_int			 y, sy = screen_size_y(s), n = 0;
+#if defined(ENABLE_IMAGES)
+	u_int			 sx = screen_size_x(s), runs;
+	u_int			 scrolled = wp->sync_scrolled;
+#endif
 
 	if (wp->sync_dirty == NULL)
 		return;
@@ -1390,8 +1405,23 @@ screen_write_sync_flush_dirty(struct window_pane *wp)
 		screen_write_sync_apply_scroll(&ctx, &ttyctx);
 
 	if (~wp->flags & PANE_REDRAW) {
+#if defined(ENABLE_IMAGES)
+		for (y = 0; y < sy; y++) {
+			runs = screen_write_sync_redraw_runs(&ctx, &ttyctx, y);
+			n += runs;
+			if (runs != 0)
+				image_redraw_area(&ctx, 0, y, sx, 1);
+		}
+		if (scrolled != 0 &&
+		    wp->sync_rupper <= wp->sync_rlower &&
+		    wp->sync_rlower < sy) {
+			image_redraw_area(&ctx, 0, wp->sync_rupper, sx,
+			    wp->sync_rlower - wp->sync_rupper + 1);
+		}
+#else
 		for (y = 0; y < sy; y++)
 			n += screen_write_sync_redraw_runs(&ctx, &ttyctx, y);
+#endif
 	}
 	log_debug("%s: %%%u had %u dirty runs", __func__, wp->id, n);
 

@@ -20,13 +20,40 @@
 #include <sys/wait.h>
 
 #include <errno.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "tmux.h"
+
+#include "platform/win32-internal.h"
+
+char *
+environ_to_win32_block(struct environ *env)
+{
+	struct environ_entry	*ee;
+	struct tmux_os_error	 error;
+	size_t			 count = 0, i = 0;
+	char			**entries;
+	wchar_t			*block;
+
+	for (ee = environ_first(env); ee != NULL; ee = environ_next(ee)) {
+		if (ee->value != NULL && *ee->name != '\0')
+			count++;
+	}
+	entries = xcalloc(count + 1, sizeof *entries);
+	for (ee = environ_first(env); ee != NULL; ee = environ_next(ee)) {
+		if (ee->value != NULL && *ee->name != '\0')
+			xasprintf(&entries[i++], "%s=%s", ee->name, ee->value);
+	}
+	block = tmux_win32_environment((const char *const *)entries, &error);
+	for (i = 0; i < count; i++)
+		free(entries[i]);
+	free(entries);
+	if (block == NULL)
+		SetLastError(error.code);
+	return ((char *)block);
+}
 
 /*
  * Set up the environment and create a new window and pane or a new pane.
@@ -293,7 +320,7 @@ spawn_pane(struct spawn_context *sc, char **cause)
 			cwd = format_single(item, sc->cwd, c, ts, NULL, NULL);
 		else
 			cwd = xstrdup(sc->cwd);
-		if (*cwd != '/') {
+		if (!path_is_absolute(cwd)) {
 			xasprintf(&new_cwd, "%s%s%s",
 			    server_client_get_cwd(c, ts),
 			    *cwd != '\0' ? "/" : "", cwd);
@@ -324,7 +351,11 @@ spawn_pane(struct spawn_context *sc, char **cause)
 		}
 		if (sc->wp0->fd != -1) {
 			window_pane_utmp_remove(sc->wp0);
-			close(sc->wp0->fd);
+			if (sc->wp0->win32_pty != NULL) {
+				win32_pty_close(sc->wp0->win32_pty);
+				sc->wp0->win32_pty = NULL;
+			} else
+				closesocket((SOCKET)sc->wp0->fd);
 			sc->wp0->fd = -1;
 		}
 		window_pane_reset_mode_all(sc->wp0);
@@ -457,8 +488,6 @@ spawn_pane(struct spawn_context *sc, char **cause)
 	ws.ws_ypixel = w->ypixel * ws.ws_row;
 
 	/* Block signals until fork has completed. */
-	sigfillset(&set);
-	sigprocmask(SIG_BLOCK, &set, &oldset);
 
 	/* If the command is empty, don't fork a child process. */
 	if (sc->flags & SPAWN_EMPTY) {
@@ -471,125 +500,127 @@ spawn_pane(struct spawn_context *sc, char **cause)
 	}
 	new_wp->flags &= ~PANE_EMPTY;
 
-	/* Store current working directory and change to new one. */
-	if (getcwd(path, sizeof path) == NULL)
-		strlcpy(path, "/", sizeof path);
-	if (chdir(new_wp->cwd) == 0)
-		actual_cwd = new_wp->cwd;
-	else if (home != NULL && chdir(home) == 0)
-		actual_cwd = home;
-	else if (chdir("/") == 0)
-		actual_cwd = "/";
+	{
+		struct win32_pty	*pty;
+		char			*cmdline, *envblock;
+		const char		*shell = new_wp->shell;
 
-	/* Fork the new process. */
-	new_wp->pid = fdforkpty(ptm_fd, &new_wp->fd, new_wp->tty, NULL, &ws);
-	if (new_wp->pid == -1) {
-		xasprintf(cause, "fork failed: %s", strerror(errno));
-		if (actual_cwd != NULL &&
-		    chdir(path) != 0 &&
-		    (home == NULL || chdir(home) != 0))
-			chdir("/");
-		new_wp->fd = -1;
-		if (~sc->flags & SPAWN_RESPAWN) {
-			server_client_remove_pane(new_wp);
-			layout_close_pane(new_wp);
-			window_remove_pane(w, new_wp);
+		if (new_wp->argc == 1) {
+			cmdline = tmux_windows_shell_command(shell,
+			    new_wp->argv[0]);
+			if (cmdline == NULL)
+				fatalx("Windows command line allocation failed");
+		} else if (new_wp->argc > 1) {
+			char	**native_argv;
+
+			native_argv = cmd_copy_argv(new_wp->argc, new_wp->argv);
+			cmdline = tmux_windows_program_command_line(
+			    (const char *const *)native_argv);
+			cmd_free_argv(new_wp->argc, native_argv);
+			if (cmdline == NULL)
+				fatalx("Windows command line allocation failed");
+		} else {
+			cmdline = tmux_windows_login_shell(shell);
+			if (cmdline == NULL)
+				fatalx("Windows command line allocation failed");
 		}
-		sigprocmask(SIG_SETMASK, &oldset, NULL);
-		environ_free(child);
-		return (NULL);
-	}
 
-	/*
-	 * In the parent process, everything is done now. Change the working
-	 * directory back.
-	 */
-	if (new_wp->pid != 0) {
-		if (actual_cwd != NULL &&
-		    chdir(path) != 0 &&
-		    (home == NULL || chdir(home) != 0))
-			chdir("/");
+		ee = environ_find(child, "PROMPT");
+		if (ee == NULL || ee->value == NULL ||
+		    strcasecmp(ee->value, "$P$G") == 0)
+			environ_set(child, "PROMPT", 0, "%s", "$e]9;9;$P$e\\$P$G");
+		if (environ_find(child, "PROMPT_COMMAND") == NULL) {
+			environ_set(child, "PROMPT_COMMAND", 0, "%s",
+			    "printf '\\033]7;file://%s/%s\\033\\\\' "
+			    "\"$HOSTNAME\" \"${PWD#/}\"");
+		}
+		free(new_wp->win32_cwd);
+		new_wp->win32_cwd = NULL;
+
+		snprintf(new_wp->tty, sizeof new_wp->tty, "conpty-%ld-%u",
+		    (long)getpid(), new_wp->id);
+		environ_set(child, "TMUX_WINDOWS_TTY", 0, "%s", new_wp->tty);
+
+		envblock = environ_to_win32_block(child);
+		ee = environ_find(child, "TMUX_WINDOWS_PANE");
+		{
+			const char	*cwds[2] = { new_wp->cwd ? new_wp->cwd : ".",
+					    home };
+			char		 sysdir[MAX_PATH], *fallback = NULL;
+			int		 attempt, pipes;
+			u_int		 codepage;
+			DWORD		 saved = 0;
+
+			pipes = (ee != NULL && ee->value != NULL &&
+			    strcmp(ee->value, "pipe") == 0);
+			ee = environ_find(child, "TMUX_WINDOWS_CODEPAGE");
+			codepage = win32_pane_codepage(ee == NULL ? NULL :
+			    ee->value);
+			pty = NULL;
+			for (attempt = 0; envblock != NULL && attempt < 3 &&
+			    pty == NULL; attempt++) {
+				const char *dir = cwds[attempt == 0 ? 0 : 1];
+				const char *line = cmdline;
+
+				if (attempt == 1 && (home == NULL ||
+				    strcmp(home, cwds[0]) == 0))
+					continue;
+				if (attempt == 2) {
+					if (GetSystemDirectoryA(sysdir,
+					    sizeof sysdir) == 0)
+						break;
+					xasprintf(&fallback,
+					    "\"%s\\cmd.exe\" /d /c exit 1",
+					    sysdir);
+					line = fallback;
+					dir = sysdir;
+					log_debug("%s: cannot start %s (error "
+					    "%lu), running exit 1 instead",
+					    __func__, cmdline,
+					    (unsigned long)saved);
+				}
+				if (dir == NULL)
+					continue;
+				if (pipes)
+					pty = win32_pipe_pane_spawn(line, dir,
+					    envblock, &new_wp->pid);
+				else
+					pty = win32_pty_spawn(line, dir,
+					    envblock, (int)ws.ws_col,
+					    (int)ws.ws_row, codepage, &new_wp->pid);
+				if (pty == NULL && attempt == 0)
+					saved = GetLastError();
+			}
+			free(fallback);
+			if (pty == NULL && saved != 0)
+				SetLastError(saved);
+		}
+		free(envblock);
+		free(cmdline);
+
+		if (pty == NULL) {
+			xasprintf(cause, "Windows spawn failed (error %lu)", (unsigned long)GetLastError());
+			new_wp->fd = -1;
+			if (~sc->flags & SPAWN_RESPAWN) {
+				server_client_remove_pane(new_wp);
+				layout_close_pane(new_wp);
+				window_remove_pane(w, new_wp);
+			}
+			environ_free(child);
+			return (NULL);
+		}
+
+		new_wp->fd = win32_pty_get_fd(pty);
+		new_wp->win32_pty = pty;
+
+		win32_process_watch(win32_pty_get_process(pty), new_wp->pid);
 		goto complete;
 	}
-
-#if defined(HAVE_SYSTEMD) && defined(ENABLE_CGROUPS)
-	/*
-	 * Move the child process into a new cgroup for systemd-oomd isolation.
-	 */
-	if (systemd_move_to_new_cgroup(cause) < 0) {
-		log_debug("%s: moving pane to new cgroup failed: %s",
-		    __func__, *cause);
-		free (*cause);
-	}
-#endif
-	/*
-	 * Child process. Set PWD to the working directory.
-	 */
-	if (actual_cwd != NULL)
-		environ_set(child, "PWD", 0, "%s", actual_cwd);
-
-	/*
-	 * Update terminal escape characters from the session if available and
-	 * force VERASE to tmux's backspace.
-	 */
-	if (tcgetattr(STDIN_FILENO, &now) != 0)
-		_exit(1);
-	if (s->tio != NULL)
-		memcpy(now.c_cc, s->tio->c_cc, sizeof now.c_cc);
-	key = options_get_number(global_options, "backspace");
-	if (key >= 0x7f)
-		now.c_cc[VERASE] = '\177';
-	else
-		now.c_cc[VERASE] = key;
-#ifdef IUTF8
-	now.c_iflag |= IUTF8;
-#endif
-	if (tcsetattr(STDIN_FILENO, TCSANOW, &now) != 0)
-		_exit(1);
-
-	/* Clean up file descriptors and signals and update the environment. */
-	proc_clear_signals(server_proc, 1);
-	closefrom(STDERR_FILENO + 1);
-	sigprocmask(SIG_SETMASK, &oldset, NULL);
-	log_close();
-	environ_push(child);
-
-	/*
-	 * If given multiple arguments, use execvp(). Copy the arguments to
-	 * ensure they end in a NULL.
-	 */
-	if (new_wp->argc != 0 && new_wp->argc != 1) {
-		argvp = cmd_copy_argv(new_wp->argc, new_wp->argv);
-		execvp(argvp[0], argvp);
-		_exit(1);
-	}
-
-	/*
-	 * If one argument, pass it to $SHELL -c. Otherwise create a login
-	 * shell.
-	 */
-	cp = strrchr(new_wp->shell, '/');
-	if (new_wp->argc == 1) {
-		tmp = new_wp->argv[0];
-		if (cp != NULL && cp[1] != '\0')
-			xasprintf(&argv0, "%s", cp + 1);
-		else
-			xasprintf(&argv0, "%s", new_wp->shell);
-		execl(new_wp->shell, argv0, "-c", tmp, (char *)NULL);
-		_exit(1);
-	}
-	if (cp != NULL && cp[1] != '\0')
-		xasprintf(&argv0, "-%s", cp + 1);
-	else
-		xasprintf(&argv0, "-%s", new_wp->shell);
-	execl(new_wp->shell, argv0, (char *)NULL);
-	_exit(1);
 
 complete:
 	new_wp->flags &= ~PANE_EXITED;
 	window_pane_utmp_add(new_wp);
 
-	sigprocmask(SIG_SETMASK, &oldset, NULL);
 	window_pane_set_event(new_wp);
 	environ_free(child);
 	spawn_fire_pane_created(sc, new_wp);
@@ -717,7 +748,7 @@ spawn_editor(struct client *c, const char *buf, size_t len,
 	struct environ			*env;
 	FILE				*f;
 	char				*cmd, *cause = NULL;
-	char				 path[] = _PATH_TMP "tmux.XXXXXXXX";
+	char				 path[MAX_PATH * 3 + 16];
 	int				 fd;
 
 	if (w->modal != NULL)
@@ -725,6 +756,7 @@ spawn_editor(struct client *c, const char *buf, size_t len,
 
 	if (editor == NULL)
 		editor = options_get_string(global_options, "editor");
+	snprintf(path, sizeof path, "%stmux.XXXXXXXX", win32_tmpdir());
 	fd = mkstemp(path);
 	if (fd == -1)
 		return (NULL);
@@ -758,7 +790,7 @@ spawn_editor(struct client *c, const char *buf, size_t len,
 		return (NULL);
 	}
 
-	xasprintf(&cmd, "%s %s", editor, path);
+	xasprintf(&cmd, "%s \"%s\"", editor, path);
 	env = environ_create();
 	sc.s = s;
 	sc.wl = wl;
@@ -769,7 +801,7 @@ spawn_editor(struct client *c, const char *buf, size_t len,
 	sc.argv = &cmd;
 	sc.environ = env;
 	sc.idx = -1;
-	sc.cwd = _PATH_TMP;
+	sc.cwd = win32_tmpdir();
 	sc.flags = SPAWN_FLOATING|SPAWN_MODAL|SPAWN_FLOATOVERZOOM;
 
 	wp = spawn_pane(&sc, &cause);

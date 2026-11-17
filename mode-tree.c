@@ -834,7 +834,7 @@ mode_tree_draw(struct mode_tree_data *mtd)
 	char			*text, *prefix;
 	const char		*tag, *separator;
 	size_t			 n;
-	int			 keylen, alignlen[mtd->maxdepth + 1];
+	int			 keylen, *alignlen;
 	int			 dfg, dfg0;
 
 	if (mtd->line_size == 0)
@@ -844,6 +844,7 @@ mode_tree_draw(struct mode_tree_data *mtd)
 	h = mtd->height;
 	if (w == 0 || h == 0)
 		return;
+	alignlen = xmalloc((mtd->maxdepth + 1) * sizeof *alignlen);
 
 	memcpy(&gc0, &grid_default_cell, sizeof gc0);
 	memcpy(&gc, &grid_default_cell, sizeof gc);
@@ -982,6 +983,7 @@ mode_tree_draw(struct mode_tree_data *mtd)
 		}
 	}
 	format_free(ft);
+	free(alignlen);
 
 	if (mtd->preview == MODE_TREE_PREVIEW_OFF)
 		goto done;

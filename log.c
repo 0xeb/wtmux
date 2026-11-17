@@ -22,7 +22,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "tmux.h"
 
@@ -66,7 +65,7 @@ log_open(const char *name)
 	if (log_file == NULL)
 		return;
 
-	setvbuf(log_file, NULL, _IOLBF, 0);
+	setvbuf(log_file, NULL, _IOLBF, BUFSIZ);
 	event_set_log_callback(log_event_cb);
 }
 

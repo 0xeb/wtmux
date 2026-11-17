@@ -17,7 +17,6 @@
  */
 
 #include <sys/types.h>
-#include <sys/time.h>
 
 #include <errno.h>
 #include <limits.h>
@@ -25,17 +24,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
 
 #include "tmux.h"
 
 static void	 status_message_area(struct client *, u_int *, u_int *);
-static void	 status_message_callback(int, short, void *);
-static void	 status_timer_callback(int, short, void *);
+static void	 status_message_callback(evutil_socket_t, short, void *);
+static void	 status_timer_callback(evutil_socket_t, short, void *);
 
 /* Status timer callback. */
 static void
-status_timer_callback(__unused int fd, __unused short events, void *arg)
+status_timer_callback(__unused evutil_socket_t fd, __unused short events,
+    void *arg)
 {
 	struct client	*c = arg;
 	struct session	*s = c->session;
@@ -653,7 +652,8 @@ status_message_area(struct client *c, u_int *area_x, u_int *area_w)
 
 /* Clear status line message after timer expires. */
 static void
-status_message_callback(__unused int fd, __unused short event, void *data)
+status_message_callback(__unused evutil_socket_t fd, __unused short event,
+    void *data)
 {
 	struct client	*c = data;
 

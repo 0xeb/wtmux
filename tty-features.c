@@ -21,12 +21,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(HAVE_CURSES_H)
-#include <curses.h>
-#elif defined(HAVE_NCURSES_H)
-#include <ncurses.h>
-#endif
-
 #include "tmux.h"
 
 /*
@@ -95,11 +89,7 @@ static const struct tty_feature tty_feature_clipboard = {
 
 /* Terminal supports OSC 8 hyperlinks. */
 static const char *tty_feature_hyperlinks_capabilities[] = {
-#if defined (__OpenBSD__) || (defined(NCURSES_VERSION_MAJOR) && \
-	(NCURSES_VERSION_MAJOR > 5 || \
-	(NCURSES_VERSION_MAJOR == 5 && NCURSES_VERSION_MINOR > 8)))
 	"Hls=\\E]8;%?%p1%l%tid=%p1%s%;;%p2%s\\E\\\\",
-#endif
 	NULL
 };
 static const struct tty_feature tty_feature_hyperlinks = {

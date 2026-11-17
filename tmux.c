@@ -18,20 +18,17 @@
 
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/utsname.h>
 
+#include <crtdbg.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <langinfo.h>
 #include <locale.h>
-#include <pwd.h>
-#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
 
 #include "tmux.h"
+#include "platform/win32-internal.h"
 
 struct options	*global_options;	/* server options */
 struct options	*global_s_options;	/* session options */
@@ -80,28 +77,53 @@ usage(int status)
 static const char *
 getshell(void)
 {
-	struct passwd	*pw;
 	const char	*shell;
 
 	shell = getenv("SHELL");
-	if (checkshell(shell))
+	if (shell != NULL && *shell != '\0')
 		return (shell);
-
-	pw = getpwuid(getuid());
-	if (pw != NULL && checkshell(pw->pw_shell))
-		return (pw->pw_shell);
-
+	shell = getenv("COMSPEC");
+	if (shell != NULL && *shell != '\0')
+		return (shell);
 	return (_PATH_BSHELL);
+}
+
+int
+path_is_absolute(const char *path)
+{
+	if (path == NULL || *path == '\0')
+		return (0);
+	if (*path == '/' || *path == '\\')
+		return (1);
+	return (((path[0] >= 'A' && path[0] <= 'Z') ||
+	    (path[0] >= 'a' && path[0] <= 'z')) && path[1] == ':' &&
+	    (path[2] == '/' || path[2] == '\\'));
+}
+
+static int
+checkshell_exe(const char *shell)
+{
+	char	*exe;
+	int	 found;
+
+	xasprintf(&exe, "%s.exe", shell);
+	found = (access(exe, X_OK) == 0);
+	free(exe);
+	return (found);
 }
 
 int
 checkshell(const char *shell)
 {
-	if (shell == NULL || *shell != '/')
+	if (shell == NULL || *shell == '\0')
 		return (0);
+	if (*shell == '/') {
+		log_debug("ignoring Unix shell path \"%s\" on Windows", shell);
+		return (0);
+	}
 	if (areshell(shell))
 		return (0);
-	if (access(shell, X_OK) != 0)
+	if (access(shell, X_OK) != 0 && !checkshell_exe(shell))
 		return (0);
 	return (1);
 }
@@ -112,6 +134,8 @@ areshell(const char *shell)
 	const char	*progname, *ptr;
 
 	if ((ptr = strrchr(shell, '/')) != NULL)
+		ptr++;
+	else if ((ptr = strrchr(shell, '\\')) != NULL)
 		ptr++;
 	else
 		ptr = shell;
@@ -206,13 +230,13 @@ check_socket_path(const char *path, char **cause)
 {
 	char	*copy, *next, *tmp;
 
-	if (*path != '/') {
+	if (!path_is_absolute(path)) {
 		xasprintf(cause, "socket directory %s is not an absolute path",
 		    path);
 		return (0);
 	}
 	copy = tmp = xstrdup(path);
-	while ((next = strsep(&tmp, "/")) != NULL) {
+	while ((next = strsep(&tmp, "/\\")) != NULL) {
 		if (strcmp(next, "..") == 0) {
 			xasprintf(cause, "socket directory %s contains ..",
 			    path);
@@ -227,62 +251,40 @@ check_socket_path(const char *path, char **cause)
 static char *
 make_label(const char *label, char **cause)
 {
-	char		**paths, *path = NULL, *base, resolved[PATH_MAX];
-	u_int		  i, n;
-	struct stat	  sb;
-	uid_t		  uid;
+	const char	*dir;
+	char		*base, *path, resolved[PATH_MAX], *s;
+	size_t		 len;
 
 	*cause = NULL;
 	if (label == NULL)
 		label = "default";
-	uid = getuid();
+	if (win32_remote_native_active())
+		return (win32_remote_native_label(label));
 
-	/*
-	 * An unset variable has already been dropped and an empty one is
-	 * skipped, but anything else must be an existing absolute path with no
-	 * ".." or it is an error.
-	 */
-	expand_paths(TMUX_SOCK, &paths, &n, 1);
-	for (i = 0; i < n; i++) {
-		if (*paths[i] == '\0')
-			continue;
-		if (!check_socket_path(paths[i], cause))
-			break;
-		if (realpath(paths[i], resolved) == NULL) {
-			xasprintf(cause,
-			    "couldn't resolve socket directory %s (%s)",
-			    paths[i], strerror(errno));
-			break;
-		}
-		path = xstrdup(resolved);
-		break;
-	}
-	for (i = 0; i < n; i++)
-		free(paths[i]);
-	free(paths);
-	if (path == NULL) {
-		if (*cause == NULL)
-			xasprintf(cause, "no suitable socket path");
+	dir = getenv("TMUX_TMPDIR");
+	if (dir == NULL || *dir == '\0')
+		dir = win32_socket_tmpdir();
+	if (!check_socket_path(dir, cause))
+		return (NULL);
+	if (realpath(dir, resolved) == NULL) {
+		xasprintf(cause, "couldn't resolve socket directory %s (%s)",
+		    dir, strerror(errno));
 		return (NULL);
 	}
-
-	xasprintf(&base, "%s/tmux-%ld", path, (long)uid);
-	free(path);
-	if (mkdir(base, S_IRWXU) != 0 && errno != EEXIST) {
+	for (s = resolved; *s != '\0'; s++) {
+		if (*s == '\\')
+			*s = '/';
+	}
+	len = strlen(resolved);
+	while (len > 3 && resolved[len - 1] == '/')
+		len--;
+	xasprintf(&base, "%.*s/tmux-%ld", (int)len, resolved, (long)getuid());
+	if (win32_mkdir_private(base) != 0 && errno != EEXIST) {
 		xasprintf(cause, "couldn't create directory %s (%s)", base,
 		    strerror(errno));
 		goto fail;
 	}
-	if (lstat(base, &sb) != 0) {
-		xasprintf(cause, "couldn't read directory %s (%s)", base,
-		    strerror(errno));
-		goto fail;
-	}
-	if (!S_ISDIR(sb.st_mode)) {
-		xasprintf(cause, "%s is not a directory", base);
-		goto fail;
-	}
-	if (sb.st_uid != uid || (sb.st_mode & TMUX_SOCK_PERM) != 0) {
+	if (!win32_owned_by_user(base)) {
 		xasprintf(cause, "directory %s has unsafe permissions", base);
 		goto fail;
 	}
@@ -302,6 +304,11 @@ shell_argv0(const char *shell, int is_login)
 	char		*argv0;
 
 	slash = strrchr(shell, '/');
+	{
+		const char *bslash = strrchr(shell, '\\');
+		if (bslash != NULL && (slash == NULL || bslash > slash))
+			slash = bslash;
+	}
 	if (slash != NULL && slash[1] != '\0')
 		name = slash + 1;
 	else
@@ -316,15 +323,8 @@ shell_argv0(const char *shell, int is_login)
 void
 setblocking(int fd, int state)
 {
-	int mode;
-
-	if ((mode = fcntl(fd, F_GETFL)) != -1) {
-		if (!state)
-			mode |= O_NONBLOCK;
-		else
-			mode &= ~O_NONBLOCK;
-		fcntl(fd, F_SETFL, mode);
-	}
+	u_long mode = state ? 0 : 1;
+	ioctlsocket((SOCKET)fd, FIONBIO, &mode);
 }
 
 uint64_t
@@ -371,10 +371,6 @@ sig2name(int signo)
 {
      static char	s[11];
 
-#ifdef HAVE_SYS_SIGNAME
-     if (signo > 0 && signo < NSIG)
-	     return (sys_signame[signo]);
-#endif
      xsnprintf(s, sizeof s, "%d", signo);
      return (s);
 }
@@ -407,20 +403,16 @@ find_cwd(void)
 const char *
 find_home(void)
 {
-	struct passwd		*pw;
 	static const char	*home;
 
 	if (home != NULL)
 		return (home);
 
-	home = getenv("HOME");
-	if (home == NULL || *home == '\0') {
-		pw = getpwuid(getuid());
-		if (pw != NULL)
-			home = xstrdup(pw->pw_dir);
-		else
-			home = NULL;
-	}
+	home = getenv("USERPROFILE");
+	if (home == NULL || *home == '\0')
+		home = getenv("HOME");
+	if (home == NULL || *home == '\0')
+		home = "C:\\";
 
 	return (home);
 }
@@ -442,17 +434,20 @@ main(int argc, char **argv)
 	const struct options_table_entry	*oe;
 	u_int					 i;
 
-	if (setlocale(LC_CTYPE, "en_US.UTF-8") == NULL &&
-	    setlocale(LC_CTYPE, "C.UTF-8") == NULL) {
-		if (setlocale(LC_CTYPE, "") == NULL)
-			errx(1, "invalid LC_ALL, LC_CTYPE or LANG");
-		s = nl_langinfo(CODESET);
-		if (strcasecmp(s, "UTF-8") != 0 && strcasecmp(s, "UTF8") != 0)
-			errx(1, "need UTF-8 locale (LC_CTYPE) but have %s", s);
-	}
-
-	setlocale(LC_TIME, "");
+	_CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+	_CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+	_CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
+	_CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
+	win32_init_environ();
+	win32_wsa_init();
+	win32_process_init();
+	win32_tty_init_utf8();
+	_setmode(_fileno(stdin), _O_BINARY);
+	_setmode(_fileno(stdout), _O_BINARY);
+	_setmode(_fileno(stderr), _O_BINARY);
+	setlocale(LC_ALL, "");
 	tzset();
+	flags |= CLIENT_UTF8;
 
 	if (**argv == '-')
 		flags = CLIENT_LOGIN;
@@ -490,6 +485,10 @@ main(int argc, char **argv)
 			}
 			cfg_files = xreallocarray(cfg_files, cfg_nfiles + 1,
 			    sizeof *cfg_files);
+
+			if (strcmp(optarg, "/dev/null") == 0)
+				cfg_files[cfg_nfiles++] = xstrdup("NUL");
+			else
 			cfg_files[cfg_nfiles++] = xstrdup(optarg);
 			cfg_quiet = 0;
 			break;
@@ -535,8 +534,6 @@ main(int argc, char **argv)
 	if ((flags & CLIENT_NOFORK) && argc != 0)
 		usage(1);
 
-	if ((ptm_fd = getptmfd()) == -1)
-		err(1, "getptmfd");
 	if (pledge("stdio rpath wpath cpath flock fattr unix getpw sendfd "
 	    "recvfd proc exec tty ps", NULL) != 0)
 		err(1, "pledge");

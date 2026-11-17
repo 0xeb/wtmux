@@ -18,15 +18,8 @@
 
 #include <sys/types.h>
 
-#if defined(HAVE_CURSES_H)
-#include <curses.h>
-#elif defined(HAVE_NCURSES_H)
-#include <ncurses.h>
-#endif
-#include <fnmatch.h>
 #include <stdlib.h>
 #include <string.h>
-#include <term.h>
 
 #include "tmux.h"
 
@@ -670,11 +663,6 @@ tty_term_create(struct tty *tty, char *name, char **caps, u_int ncaps,
 		a = options_array_next(a);
 	}
 
-	/* Delete curses data. */
-#if !defined(NCURSES_VERSION_MAJOR) || NCURSES_VERSION_MAJOR > 5 || \
-    (NCURSES_VERSION_MAJOR == 5 && NCURSES_VERSION_MINOR > 6)
-	del_curterm(cur_term);
-#endif
 	/* Check for COLORTERM. */
 	envent = environ_find(c->environ, "COLORTERM");
 	if (envent != NULL) {
@@ -685,6 +673,8 @@ tty_term_create(struct tty *tty, char *name, char **caps, u_int ncaps,
  		else if (strstr(envent->value, "256") != NULL)
 			tty_parse_client_features(c, "256", ",");
 	}
+
+	tty_parse_client_features(c, "256,RGB", ",");
 
 	/* Apply overrides so any capabilities used for features are changed. */
 	tty_term_apply_overrides(term);
@@ -761,73 +751,34 @@ int
 tty_term_read_list(const char *name, int fd, char ***caps, u_int *ncaps,
     char **cause)
 {
-	const struct tty_term_code_entry	*ent;
-	int					 error, n;
-	u_int					 i;
-	const char				*s;
-	char					 tmp[11];
+	const struct win32_terminfo_entry	*table;
+	u_int					 count, i;
 
-	if (setupterm((char *)name, fd, &error) != OK) {
-		switch (error) {
-		case 1:
-			xasprintf(cause, "can't use hardcopy terminal: %s",
-			    name);
-			break;
-		case 0:
-			xasprintf(cause, "missing or unsuitable terminal: %s",
-			    name);
-			break;
-		case -1:
-			xasprintf(cause, "can't find terminfo database");
-			break;
-		default:
-			xasprintf(cause, "unknown error");
-			break;
-		}
-		return (-1);
-	}
+	table = win32_terminfo_table(name, &count);
 
 	*ncaps = 0;
 	*caps = NULL;
 
-	for (i = 0; i < tty_term_ncodes(); i++) {
-		ent = &tty_term_codes[i];
-		switch (ent->type) {
-		case TTYCODE_NONE:
-			continue;
-		case TTYCODE_STRING:
-			s = tigetstr((char *)ent->name);
-			if (s == NULL || s == (char *)-1)
-				continue;
+	for (i = 0; i < count; i++) {
+		*caps = xreallocarray(*caps, (*ncaps) + 1, sizeof **caps);
+		switch (table[i].type) {
+		case 1:
+			xasprintf(&(*caps)[*ncaps], "%s=%s", table[i].name,
+			    table[i].value != NULL ? table[i].value : "");
 			break;
-		case TTYCODE_NUMBER:
-			n = tigetnum((char *)ent->name);
-			if (n == -1 || n == -2)
-				continue;
-			xsnprintf(tmp, sizeof tmp, "%d", n);
-			s = tmp;
+		case 2:
+			xasprintf(&(*caps)[*ncaps], "%s=%d", table[i].name,
+			    table[i].numeric);
 			break;
-		case TTYCODE_FLAG:
-			n = tigetflag((char *)ent->name);
-			if (n == -1)
-				continue;
-			if (n)
-				s = "1";
-			else
-				s = "0";
+		case 3:
+			xasprintf(&(*caps)[*ncaps], "%s=%d", table[i].name,
+			    table[i].flag);
 			break;
 		default:
-			fatalx("unknown capability type");
+			continue;
 		}
-		*caps = xreallocarray(*caps, (*ncaps) + 1, sizeof **caps);
-		xasprintf(&(*caps)[*ncaps], "%s=%s", ent->name, s);
 		(*ncaps)++;
 	}
-
-#if !defined(NCURSES_VERSION_MAJOR) || NCURSES_VERSION_MAJOR > 5 || \
-    (NCURSES_VERSION_MAJOR == 5 && NCURSES_VERSION_MINOR > 6)
-	del_curterm(cur_term);
-#endif
 	return (0);
 }
 
@@ -882,13 +833,7 @@ tty_term_string_i(struct tty_term *term, enum tty_code_code code, int a)
 	}
 	x = tty_term_string(term, code);
 
-#if defined(HAVE_TIPARM_S)
-	s = tiparm_s(1, 0, x, a);
-#elif defined(HAVE_TIPARM)
-	s = tiparm(x, a);
-#else
 	s = tparm((char *)x, a, 0, 0, 0, 0, 0, 0, 0, 0);
-#endif
 	if (s == NULL) {
 		log_debug("could not expand %s", tty_term_codes[code].name);
 		return ("");
@@ -901,13 +846,7 @@ tty_term_string_ii(struct tty_term *term, enum tty_code_code code, int a, int b)
 {
 	const char	*x = tty_term_string(term, code), *s;
 
-#if defined(HAVE_TIPARM_S)
-	s = tiparm_s(2, 0, x, a, b);
-#elif defined(HAVE_TIPARM)
-	s = tiparm(x, a, b);
-#else
 	s = tparm((char *)x, a, b, 0, 0, 0, 0, 0, 0, 0);
-#endif
 	if (s == NULL) {
 		log_debug("could not expand %s", tty_term_codes[code].name);
 		return ("");
@@ -921,13 +860,7 @@ tty_term_string_iii(struct tty_term *term, enum tty_code_code code, int a,
 {
 	const char	*x = tty_term_string(term, code), *s;
 
-#if defined(HAVE_TIPARM_S)
-	s = tiparm_s(3, 0, x, a, b, c);
-#elif defined(HAVE_TIPARM)
-	s = tiparm(x, a, b, c);
-#else
 	s = tparm((char *)x, a, b, c, 0, 0, 0, 0, 0, 0);
-#endif
 	if (s == NULL) {
 		log_debug("could not expand %s", tty_term_codes[code].name);
 		return ("");
@@ -940,13 +873,7 @@ tty_term_string_s(struct tty_term *term, enum tty_code_code code, const char *a)
 {
 	const char	*x = tty_term_string(term, code), *s;
 
-#if defined(HAVE_TIPARM_S)
-	s = tiparm_s(1, 1, x, a);
-#elif defined(HAVE_TIPARM)
-	s = tiparm(x, a);
-#else
-	s = tparm((char *)x, (long)a, 0, 0, 0, 0, 0, 0, 0, 0);
-#endif
+	s = tparm((char *)x, (tmux_tparm_arg)a, 0, 0, 0, 0, 0, 0, 0, 0);
 	if (s == NULL) {
 		log_debug("could not expand %s", tty_term_codes[code].name);
 		return ("");
@@ -960,13 +887,7 @@ tty_term_string_ss(struct tty_term *term, enum tty_code_code code,
 {
 	const char	*x = tty_term_string(term, code), *s;
 
-#if defined(HAVE_TIPARM_S)
-	s = tiparm_s(2, 3, x, a, b);
-#elif defined(HAVE_TIPARM)
-	s = tiparm(x, a, b);
-#else
-	s = tparm((char *)x, (long)a, (long)b, 0, 0, 0, 0, 0, 0, 0);
-#endif
+	s = tparm((char *)x, (tmux_tparm_arg)a, (tmux_tparm_arg)b, 0, 0, 0, 0, 0, 0, 0);
 	if (s == NULL) {
 		log_debug("could not expand %s", tty_term_codes[code].name);
 		return ("");

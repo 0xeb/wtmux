@@ -25,7 +25,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
 
 #include "tmux.h"
 
@@ -705,7 +704,7 @@ control_read_callback(__unused struct bufferevent *bufev, void *data)
 	enum cmd_parse_status	 status;
 
 	for (;;) {
-		line = evbuffer_readln(buffer, NULL, EVBUFFER_EOL_LF);
+		line = evbuffer_readln(buffer, NULL, EVBUFFER_EOL_CRLF);
 		if (line == NULL)
 			break;
 		log_debug("%s: %s: %s", __func__, c->name, line);
@@ -744,43 +743,13 @@ control_all_done(struct client *c)
 void
 control_wait_exit(int fd)
 {
-	struct pollfd	 pfd;
-	struct evbuffer	*evb;
-	char		*line;
-	int		 n;
+	char	*line = NULL;
+	size_t	 linesize = 0;
 
-	evb = evbuffer_new();
-	if (evb == NULL)
-		fatalx("out of memory");
-
-	for (;;) {
-		line = evbuffer_readln(evb, NULL, EVBUFFER_EOL_LF);
-		if (line != NULL) {
-			if (*line == '\0') { /* empty line, stop */
-				free(line);
-				break;
-			}
-			free(line);
-			continue; /* drain buffered lines first */
-		}
-
-		memset(&pfd, 0, sizeof pfd);
-		pfd.fd = fd;
-		pfd.events = POLLIN;
-		if (poll(&pfd, 1, INFTIM) == -1) {
-			if (errno == EINTR)
-				continue;
-			break;
-		}
-
-		n = evbuffer_read(evb, fd, -1);
-		if (n == 0)
-			break;
-		if (n == -1 && errno != EAGAIN && errno != EINTR)
-			break;
-	}
-
-	evbuffer_free(evb);
+	setvbuf(stdin, NULL, _IOLBF, BUFSIZ);
+	while (getline(&line, &linesize, stdin) > 1)
+		continue;
+	free(line);
 }
 
 /* Flush all blocks until output. */
@@ -991,11 +960,10 @@ control_start(struct client *c)
 {
 	struct control_state	*cs;
 
-	if (c->flags & CLIENT_CONTROLCONTROL) {
+	if (c->out_fd != -1) {
 		close(c->out_fd);
 		c->out_fd = -1;
-	} else
-		setblocking(c->out_fd, 0);
+	}
 	setblocking(c->fd, 0);
 
 	cs = c->control_state = xcalloc(1, sizeof *cs);
@@ -1011,14 +979,7 @@ control_start(struct client *c)
 	if (cs->read_event == NULL)
 		fatalx("out of memory");
 
-	if (c->flags & CLIENT_CONTROLCONTROL)
-		cs->write_event = cs->read_event;
-	else {
-		cs->write_event = bufferevent_new(c->out_fd, NULL,
-		    control_write_callback, control_error_callback, c);
-		if (cs->write_event == NULL)
-			fatalx("out of memory");
-	}
+	cs->write_event = cs->read_event;
 	bufferevent_setwatermark(cs->write_event, EV_WRITE, CONTROL_BUFFER_LOW,
 	    0);
 

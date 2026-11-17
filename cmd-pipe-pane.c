@@ -17,17 +17,15 @@
  */
 
 #include <sys/types.h>
-#include <sys/socket.h>
 
 #include <errno.h>
 #include <fcntl.h>
-#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
 
 #include "tmux.h"
+#include "platform/tmux-platform.h"
 
 /*
  * Open pipe to redirect pane output. If already open, close first.
@@ -64,9 +62,8 @@ cmd_pipe_pane_exec(struct cmd *self, struct cmdq_item *item)
 	struct winlink			*wl = target->wl;
 	struct window_pane_offset	*wpo = &wp->pipe_offset;
 	char				*cmd;
-	int				 old_fd, pipe_fd[2], null_fd, in, out;
+	int				 old_fd, pipe_fd[2], in, out;
 	struct format_tree		*ft;
-	sigset_t			 set, oldset;
 
 	/* Do nothing if pane is dead. */
 	if (window_pane_exited(wp)) {
@@ -77,9 +74,7 @@ cmd_pipe_pane_exec(struct cmd *self, struct cmdq_item *item)
 	/* Destroy the old pipe. */
 	old_fd = wp->pipe_fd;
 	if (wp->pipe_fd != -1) {
-		bufferevent_free(wp->pipe_event);
-		close(wp->pipe_fd);
-		wp->pipe_fd = -1;
+		window_pane_close_pipe(wp);
 
 		if (window_pane_destroy_ready(wp)) {
 			server_destroy_pane(wp, 1);
@@ -109,68 +104,42 @@ cmd_pipe_pane_exec(struct cmd *self, struct cmdq_item *item)
 		out = 1;
 	}
 
-	/* Open the new pipe. */
-	if (socketpair(AF_UNIX, SOCK_STREAM, PF_UNSPEC, pipe_fd) != 0) {
-		cmdq_error(item, "socketpair error: %s", strerror(errno));
-		return (CMD_RETURN_ERROR);
-	}
-
 	/* Expand the command. */
 	ft = format_create(cmdq_get_client(item), item, FORMAT_NONE, 0);
 	format_defaults(ft, tc, s, wl, wp);
 	cmd = format_expand_time(ft, args_string(args, 0));
 	format_free(ft);
 
-	/* Fork the child. */
-	sigfillset(&set);
-	sigprocmask(SIG_BLOCK, &set, &oldset);
-	switch ((wp->pipe_pid = fork())) {
-	case -1:
-		sigprocmask(SIG_SETMASK, &oldset, NULL);
-		cmdq_error(item, "fork error: %s", strerror(errno));
+	{
+		struct win32_pty	*child = NULL;
+		struct environ		*env;
+		const char		*shell;
+		char			*envblock, *command;
+		pid_t			 child_pid;
 
-		close(pipe_fd[0]);
-		close(pipe_fd[1]);
-		free(cmd);
-		return (CMD_RETURN_ERROR);
-	case 0:
-		/* Child process. */
-		proc_clear_signals(server_proc, 1);
-		sigprocmask(SIG_SETMASK, &oldset, NULL);
-		close(pipe_fd[0]);
-
-		if (setpgid(0, 0) == -1)
-			_exit(1);
-
-		null_fd = open(_PATH_DEVNULL, O_WRONLY);
-		if (out) {
-			if (dup2(pipe_fd[1], STDIN_FILENO) == -1)
-				_exit(1);
-		} else {
-			if (dup2(null_fd, STDIN_FILENO) == -1)
-				_exit(1);
+		shell = options_get_string(s->options, "default-shell");
+		if (!checkshell(shell))
+			shell = _PATH_BSHELL;
+		env = environ_for_session(s, 0);
+		environ_set(env, "SHELL", 0, "%s", shell);
+		envblock = environ_to_win32_block(env);
+		command = tmux_windows_shell_command(shell, cmd);
+		if (envblock != NULL && command != NULL) {
+			child = win32_pipe_spawn(command, wp->cwd, envblock,
+			    &child_pid);
 		}
-		if (in) {
-			if (dup2(pipe_fd[1], STDOUT_FILENO) == -1)
-				_exit(1);
-			if (pipe_fd[1] != STDOUT_FILENO)
-				close(pipe_fd[1]);
-		} else {
-			if (dup2(null_fd, STDOUT_FILENO) == -1)
-				_exit(1);
+		free(command);
+		free(envblock);
+		environ_free(env);
+		if (child == NULL) {
+			cmdq_error(item, "pipe spawn failed (error %lu)",
+			    (unsigned long)GetLastError());
+			free(cmd);
+			return (CMD_RETURN_ERROR);
 		}
-		if (dup2(null_fd, STDERR_FILENO) == -1)
-			_exit(1);
-		closefrom(STDERR_FILENO + 1);
-
-		execl(_PATH_BSHELL, "sh", "-c", cmd, (char *) NULL);
-		_exit(1);
-	default:
-		/* Parent process. */
-		sigprocmask(SIG_SETMASK, &oldset, NULL);
-		close(pipe_fd[1]);
-
-		wp->pipe_fd = pipe_fd[0];
+		wp->win32_pipe_child = child;
+		wp->pipe_fd = win32_pty_get_fd(child);
+		win32_process_watch(win32_pty_get_process(child), child_pid);
 		memcpy(wpo, &wp->offset, sizeof *wpo);
 
 		setblocking(wp->pipe_fd, 0);
@@ -231,9 +200,7 @@ cmd_pipe_pane_error_callback(__unused struct bufferevent *bufev,
 
 	log_debug("%%%u pipe error", wp->id);
 
-	bufferevent_free(wp->pipe_event);
-	close(wp->pipe_fd);
-	wp->pipe_fd = -1;
+	window_pane_close_pipe(wp);
 
 	if (window_pane_destroy_ready(wp))
 		server_destroy_pane(wp, 1);

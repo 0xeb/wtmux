@@ -1083,6 +1083,8 @@ image_redraw_area(struct screen_write_ctx *ctx, u_int x, u_int y, u_int sx,
 		return;
 	if (!image_grid_area_has_images(gd, x, gd->hsize + y, sx, sy))
 		return;
+	if (screen_write_sync_defer(ctx, y, sy))
+		return;
 	redraw_damage_window(wp->window, wp->xoff + x, wp->yoff + y, sx, sy);
 }
 
@@ -1115,6 +1117,10 @@ image_redraw_scroll(struct screen_write_ctx *ctx)
 	if (!image_grid_area_has_images(gd, 0, hsize + rupper, sx, sy))
 		return;
 
+	if (s->mode & MODE_SYNC) {
+		image_grid_mark_scroll(gd, hsize + rupper, hsize + rlower);
+		return;
+	}
 	if (image_grid_mark_scroll(gd, hsize + rupper, hsize + rlower))
 		redraw_damage_window(wp->window, xoff, yoff + rupper, sx, sy);
 	else

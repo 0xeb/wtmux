@@ -21,7 +21,7 @@
 #include "compat.h"
 
 int
-utf8proc_wcwidth(wchar_t wc)
+utf8proc_wcwidth(tmux_wchar_t wc)
 {
 	int	cat;
 
@@ -37,9 +37,10 @@ utf8proc_wcwidth(wchar_t wc)
 }
 
 int
-utf8proc_mbtowc(wchar_t *pwc, const char *s, size_t n)
+utf8proc_mbtowc(tmux_wchar_t *pwc, const char *s, size_t n)
 {
 	utf8proc_ssize_t	slen;
+	utf8proc_int32_t codepoint = -1;
 
 	if (s == NULL)
 		return (0);
@@ -48,14 +49,15 @@ utf8proc_mbtowc(wchar_t *pwc, const char *s, size_t n)
 	 * *pwc == -1 indicates invalid codepoint
 	 * slen < 0 indicates an error
 	 */
-	slen = utf8proc_iterate(s, n, (utf8proc_int32_t*)pwc);
-	if (*pwc == (wchar_t)-1 || slen < 0)
+	slen = utf8proc_iterate((const utf8proc_uint8_t *)s, n, &codepoint);
+	if (codepoint == -1 || slen < 0)
 		return (-1);
+	*pwc = (tmux_wchar_t)codepoint;
 	return (slen);
 }
 
 int
-utf8proc_wctomb(char *s, wchar_t wc)
+utf8proc_wctomb(char *s, tmux_wchar_t wc)
 {
 	if (s == NULL)
 		return (0);

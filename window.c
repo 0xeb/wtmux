@@ -17,20 +17,15 @@
  */
 
 #include <sys/types.h>
-#include <sys/ioctl.h>
-#include <sys/wait.h>
 
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <fnmatch.h>
 #include <regex.h>
-#include <signal.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
 
 #include "tmux.h"
 
@@ -72,7 +67,7 @@ static struct window_pane *window_pane_create(struct window *, u_int, u_int,
 		    u_int);
 static void	window_pane_destroy(struct window_pane *);
 static void	window_pane_free(struct window_pane *);
-static void	window_pane_scrollbar_timer(int, short, void *);
+static void	window_pane_scrollbar_timer(evutil_socket_t, short, void *);
 static void	window_pane_full_size_offset(struct window_pane *, int *, int *,
 		    u_int *, u_int *);
 
@@ -497,11 +492,11 @@ window_destroy(struct window *w)
 int
 window_pane_destroy_ready(struct window_pane *wp)
 {
-	int	n;
+	u_long	avail;
 
 	if (wp->pipe_fd != -1 && EVBUFFER_LENGTH(wp->pipe_event->output) != 0)
 		return (0);
-	if (ioctl(wp->fd, FIONREAD, &n) != -1 && n > 0)
+	if (ioctlsocket((SOCKET)wp->fd, FIONREAD, &avail) == 0 && avail > 0)
 		return (0);
 
 	if (~wp->flags & PANE_EXITED)
@@ -607,22 +602,9 @@ window_pane_send_resize(struct window_pane *wp, u_int sx, u_int sy)
 
 	log_debug("%s: %%%u resize to %u,%u", __func__, wp->id, sx, sy);
 
-	memset(&ws, 0, sizeof ws);
-	ws.ws_col = sx;
-	ws.ws_row = sy;
-	ws.ws_xpixel = w->xpixel * ws.ws_col;
-	ws.ws_ypixel = w->ypixel * ws.ws_row;
-	if (ioctl(wp->fd, TIOCSWINSZ, &ws) == -1)
-#ifdef __sun
-		/*
-		 * Some versions of Solaris apparently can return an error when
-		 * resizing; don't know why this happens, can't reproduce on
-		 * other platforms and ignoring it doesn't seem to cause any
-		 * issues.
-		 */
-		if (errno != EINVAL && errno != ENXIO)
-#endif
-		fatal("ioctl failed");
+	if (wp->win32_pty != NULL)
+		win32_pty_resize((struct win32_pty *)wp->win32_pty,
+		    (int)sx, (int)sy);
 }
 
 int
@@ -1569,7 +1551,8 @@ window_pane_free_modes(struct window_pane *wp)
 }
 
 static void
-window_pane_scrollbar_timer(__unused int fd, __unused short events, void *arg)
+window_pane_scrollbar_timer(__unused evutil_socket_t fd, __unused short events,
+    void *arg)
 {
 	struct window_pane	*wp = arg;
 
@@ -1611,45 +1594,30 @@ window_pane_scrollbar_redraw_visibility(struct window_pane *wp)
 	server_redraw_window(wp->window);
 }
 
-#ifdef HAVE_UTEMPTER
-void
-window_pane_utmp_add(struct window_pane *wp)
-{
-	char	*cp;
-
-	if (wp->fd == -1 ||
-	    (wp->flags & (PANE_EMPTY|PANE_EXITED|PANE_UTMP)) ||
-	    !options_get_number(global_options, "utmp"))
-		return;
-	xasprintf(&cp, "tmux(%lu).%%%u", (long)getpid(), wp->id);
-	utempter_add_record(wp->fd, cp);
-	kill(getpid(), SIGCHLD);
-	wp->flags |= PANE_UTMP;
-	free(cp);
-}
-#else
 void
 window_pane_utmp_add(__unused struct window_pane *wp)
 {
 }
-#endif
 
-#ifdef HAVE_UTEMPTER
-void
-window_pane_utmp_remove(struct window_pane *wp)
-{
-	if (~wp->flags & PANE_UTMP)
-		return;
-	utempter_remove_record(wp->fd);
-	kill(getpid(), SIGCHLD);
-	wp->flags &= ~PANE_UTMP;
-}
-#else
 void
 window_pane_utmp_remove(__unused struct window_pane *wp)
 {
 }
-#endif
+
+void
+window_pane_close_pipe(struct window_pane *wp)
+{
+	if (wp->pipe_fd == -1)
+		return;
+	bufferevent_free(wp->pipe_event);
+	wp->pipe_event = NULL;
+	if (wp->win32_pipe_child != NULL) {
+		win32_pty_close(wp->win32_pipe_child);
+		wp->win32_pipe_child = NULL;
+	} else
+		closesocket((SOCKET)wp->pipe_fd);
+	wp->pipe_fd = -1;
+}
 
 static void
 window_pane_destroy(struct window_pane *wp)
@@ -1671,6 +1639,10 @@ window_pane_destroy(struct window_pane *wp)
 	}
 	if (wp->fd != -1) {
 		window_pane_utmp_remove(wp);
+		if (wp->win32_pty != NULL) {
+			win32_pty_close((struct win32_pty *)wp->win32_pty);
+			wp->win32_pty = NULL;
+		} else
 		close(wp->fd);
 		wp->fd = -1;
 	}
@@ -1679,12 +1651,7 @@ window_pane_destroy(struct window_pane *wp)
 		wp->ictx = NULL;
 	}
 
-	if (wp->pipe_fd != -1) {
-		bufferevent_free(wp->pipe_event);
-		wp->pipe_event = NULL;
-		close(wp->pipe_fd);
-		wp->pipe_fd = -1;
-	}
+	window_pane_close_pipe(wp);
 
 	if (event_initialized(&wp->resize_timer))
 		event_del(&wp->resize_timer);
@@ -1709,6 +1676,7 @@ window_pane_free(struct window_pane *wp)
 	free(wp->r.ranges);
 	options_free(wp->options);
 	free((void *)wp->cwd);
+	free(wp->win32_cwd);
 	free(wp->shell);
 	cmd_free_argv(wp->argc, wp->argv);
 	colour_palette_free(&wp->palette);

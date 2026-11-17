@@ -17,27 +17,24 @@
  */
 
 #include <sys/types.h>
-#include <sys/ioctl.h>
-#include <sys/uio.h>
 
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
 
 #include "tmux.h"
 
-static void	server_client_free(int, short, void *);
+static void	server_client_free(evutil_socket_t, short, void *);
 static void	server_client_check_pane_resize(struct window_pane *);
 static void	server_client_check_pane_buffer(struct window_pane *);
 static void	server_client_check_window_resize(struct window *);
 static key_code	server_client_check_mouse(struct client *, struct key_event *);
-static void	server_client_repeat_timer(int, short, void *);
-static void	server_client_click_timer(int, short, void *);
+static void	server_client_repeat_timer(evutil_socket_t, short, void *);
+static void	server_client_click_timer(evutil_socket_t, short, void *);
 static void	server_client_check_exit(struct client *, int);
-static void	server_client_exit_timer(int, short, void *);
+static void	server_client_exit_timer(evutil_socket_t, short, void *);
 static void	server_client_check_redraw(struct client *);
 static void	server_client_check_modes(struct client *);
 static void	server_client_set_title(struct client *);
@@ -71,6 +68,36 @@ server_client_how_many(void)
 			n++;
 	}
 	return (n);
+}
+
+static enum cmd_retval
+server_client_tty_wait_cb(__unused struct cmdq_item *item, __unused void *data)
+{
+	struct client	*c = cmdq_get_client(item);
+
+	if (c->tty_token != NULL)
+		return (CMD_RETURN_WAIT);
+	return (CMD_RETURN_NORMAL);
+}
+
+static void
+server_client_tty_wait_timeout(__unused evutil_socket_t fd,
+    __unused short events, void *data)
+{
+	struct client	*c = data;
+
+	log_debug("client %p tty wait timeout", c);
+
+	free(c->tty_token);
+	c->tty_token = NULL;
+
+	if (c->tty_wait_item != NULL) {
+		cmdq_continue(c->tty_wait_item);
+		c->tty_wait_item = NULL;
+	}
+
+	if ((c->flags & CLIENT_CONTROL) && c->control_state == NULL)
+		proc_kill_peer(c->peer);
 }
 
 /* Are these ranges empty? That is, nothing is visible. */
@@ -222,20 +249,6 @@ server_client_open(struct client *c, char **cause)
 
 	if (c->flags & CLIENT_CONTROL)
 		return (0);
-
-	if (strcmp(c->ttyname, ttynam) == 0||
-	    ((isatty(STDIN_FILENO) &&
-	    (ttynam = ttyname(STDIN_FILENO)) != NULL &&
-	    strcmp(c->ttyname, ttynam) == 0) ||
-	    (isatty(STDOUT_FILENO) &&
-	    (ttynam = ttyname(STDOUT_FILENO)) != NULL &&
-	    strcmp(c->ttyname, ttynam) == 0) ||
-	    (isatty(STDERR_FILENO) &&
-	    (ttynam = ttyname(STDERR_FILENO)) != NULL &&
-	    strcmp(c->ttyname, ttynam) == 0))) {
-		xasprintf(cause, "can't use %s", c->ttyname);
-		return (-1);
-	}
 
 	if (!(c->flags & CLIENT_TERMINAL)) {
 		*cause = xstrdup("not a terminal");
@@ -455,6 +468,9 @@ server_client_lost(struct client *c)
 	if (c->flags & CLIENT_TERMINAL)
 		tty_free(&c->tty);
 	free(c->ttyname);
+	free(c->tty_token);
+	if (event_initialized(&c->tty_wait_timer))
+		evtimer_del(&c->tty_wait_timer);
 	free(c->clipboard_panes);
 
 	free(c->term_name);
@@ -493,7 +509,7 @@ server_client_lost(struct client *c)
 	if (c->out_fd != -1)
 		close(c->out_fd);
 	if (c->fd != -1) {
-		close(c->fd);
+		closesocket((SOCKET)c->fd);
 		c->fd = -1;
 	}
 	server_client_unref(c);
@@ -518,7 +534,8 @@ server_client_unref(struct client *c)
 
 /* Free dead client. */
 static void
-server_client_free(__unused int fd, __unused short events, void *arg)
+server_client_free(__unused evutil_socket_t fd, __unused short events,
+    void *arg)
 {
 	struct client	*c = arg;
 
@@ -2043,7 +2060,8 @@ server_client_check_window_resize(struct window *w)
 
 /* Resize timer event. */
 static void
-server_client_resize_timer(__unused int fd, __unused short events, void *data)
+server_client_resize_timer(__unused evutil_socket_t fd, __unused short events,
+    void *data)
 {
 	struct window_pane	*wp = data;
 
@@ -2404,7 +2422,8 @@ server_client_reset_state(struct client *c)
 
 /* Repeat time callback. */
 static void
-server_client_repeat_timer(__unused int fd, __unused short events, void *data)
+server_client_repeat_timer(__unused evutil_socket_t fd, __unused short events,
+    void *data)
 {
 	struct client	*c = data;
 
@@ -2417,7 +2436,8 @@ server_client_repeat_timer(__unused int fd, __unused short events, void *data)
 
 /* Double-click callback. */
 static void
-server_client_click_timer(__unused int fd, __unused short events, void *data)
+server_client_click_timer(__unused evutil_socket_t fd, __unused short events,
+    void *data)
 {
 	struct client		*c = data;
 	struct key_event	*event;
@@ -2452,7 +2472,8 @@ server_client_start_exit_timer(struct client *c)
 
 /* Exit timer has expired: stop waiting for the client. */
 static void
-server_client_exit_timer(__unused int fd, __unused short events, void *data)
+server_client_exit_timer(__unused evutil_socket_t fd, __unused short events,
+    void *data)
 {
 	struct client	*c = data;
 
@@ -2502,6 +2523,8 @@ server_client_check_exit(struct client *c, int force)
 		}
 	}
 	c->flags |= CLIENT_EXITED;
+	if ((c->flags & CLIENT_CONTROL) && c->fd != -1)
+		shutdown((SOCKET)c->fd, SD_SEND);
 
 	evtimer_del(&c->exit_timer);
 	server_client_start_exit_timer(c);
@@ -2531,7 +2554,7 @@ server_client_check_exit(struct client *c, int force)
 
 /* Redraw timer callback. */
 static void
-server_client_redraw_timer(__unused int fd, __unused short events,
+server_client_redraw_timer(__unused evutil_socket_t fd, __unused short events,
     __unused void *data)
 {
 	log_debug("redraw timer fired");
@@ -2795,6 +2818,7 @@ server_client_dispatch(struct imsg *imsg, void *arg)
 	case MSG_IDENTIFY_TERM:
 	case MSG_IDENTIFY_TERMINFO:
 	case MSG_IDENTIFY_TTYNAME:
+	case MSG_IDENTIFY_TTYTOKEN:
 	case MSG_IDENTIFY_DONE:
 		if (server_client_dispatch_identify(c, imsg) != 0)
 			goto bad;
@@ -2804,15 +2828,38 @@ server_client_dispatch(struct imsg *imsg, void *arg)
 			goto bad;
 		break;
 	case MSG_RESIZE:
-		if (datalen != 0)
+		if (datalen != 0 &&
+		    datalen != sizeof(struct msg_resize_data))
 			goto bad;
+
+		if (datalen == sizeof(struct msg_resize_data) &&
+		    (~c->flags & CLIENT_CONTROL) &&
+		    (~c->tty.flags & TTY_OPENED)) {
+			struct msg_resize_data	*rd = imsg->data;
+
+			tty_set_size(&c->tty, rd->sx == 0 ? 80 : rd->sx,
+			    rd->sy == 0 ? 24 : rd->sy, 0, 0);
+			break;
+		}
 
 		if ((c->flags & CLIENT_CONTROL) || (~c->tty.flags & TTY_OPENED))
 			break;
 		server_client_update_latest(c);
 		old_sx = c->tty.sx;
 		old_sy = c->tty.sy;
-		tty_resize(&c->tty);
+		if (datalen == sizeof(struct msg_resize_data)) {
+			struct msg_resize_data	*rd = imsg->data;
+			u_int			 sx = rd->sx, sy = rd->sy;
+
+			if (sx == 0)
+				sx = 80;
+			if (sy == 0)
+				sy = 24;
+			log_debug("client %p resize from msg: %ux%u",
+			    c, sx, sy);
+			tty_resize_client(&c->tty, sx, sy);
+		} else
+			tty_resize(&c->tty);
 		tty_repeat_requests(&c->tty, 0);
 		server_client_apply_resize(c, old_sx, old_sy);
 		break;
@@ -2822,7 +2869,26 @@ server_client_dispatch(struct imsg *imsg, void *arg)
 		server_client_set_session(c, NULL);
 		recalculate_sizes();
 		tty_close(&c->tty);
+		if (c->fd != -1)
+			shutdown((SOCKET)c->fd, SD_SEND);
 		proc_send(c->peer, MSG_EXITED, -1, NULL, 0);
+		break;
+	case MSG_WIN32_TTY_INPUT:
+		if (datalen > 0 && c->tty.in != NULL)
+			evbuffer_add(c->tty.in, imsg->data, datalen);
+		break;
+	case MSG_WIN32_TTY_RESIZE:
+		if (c->flags & CLIENT_CONTROL)
+			break;
+		server_client_update_latest(c);
+		old_sx = c->tty.sx;
+		old_sy = c->tty.sy;
+		tty_resize(&c->tty);
+		tty_repeat_requests(&c->tty, 0);
+		recalculate_sizes();
+		server_redraw_client(c);
+		if (c->session != NULL)
+			server_client_fire_resized(c, old_sx, old_sy);
 		break;
 	case MSG_WAKEUP:
 	case MSG_UNLOCK:
@@ -3085,6 +3151,23 @@ server_client_dispatch_identify(struct client *c, struct imsg *imsg)
 			return (-1);
 		memcpy(&c->pid, data, sizeof c->pid);
 		log_debug("client %p IDENTIFY_CLIENTPID %ld", c, (long)c->pid);
+		server_launcher_arrived(c->pid);
+		break;
+	case MSG_IDENTIFY_TTYTOKEN:
+		if (datalen == 0 || data[datalen - 1] != '\0')
+			return (-1);
+		c->tty_token = xstrdup(data);
+		log_debug("client %p IDENTIFY_TTYTOKEN %s", c, data);
+		{
+			int tty_fd = server_get_pending_tty(data);
+			if (tty_fd != -1) {
+				c->fd = tty_fd;
+				free(c->tty_token);
+				c->tty_token = NULL;
+				log_debug("client %p matched tty fd %d",
+				    c, tty_fd);
+			}
+		}
 		break;
 	default:
 		break;
@@ -3106,16 +3189,33 @@ server_client_dispatch_identify(struct client *c, struct imsg *imsg)
 	c->name = name;
 	log_debug("client %p name is %s", c, c->name);
 
-#ifdef __CYGWIN__
-	c->fd = open(c->ttyname, O_RDWR|O_NOCTTY);
-	c->out_fd = dup(c->fd);
-#endif
+	if (c->fd == -1 && c->tty_token != NULL) {
+		int tty_fd = server_get_pending_tty(c->tty_token);
+		if (tty_fd != -1) {
+			c->fd = tty_fd;
+			log_debug("client %p late-matched tty fd %d",
+			    c, tty_fd);
+			free(c->tty_token);
+			c->tty_token = NULL;
+		} else {
+			struct timeval	tv = { .tv_sec = 2 };
 
-	if (c->flags & CLIENT_CONTROL)
-		control_start(c);
-	else if (c->fd != -1) {
+			log_debug("client %p deferring for tty channel", c);
+			c->tty_wait_item = cmdq_get_callback(
+			    server_client_tty_wait_cb, NULL);
+			cmdq_append(c, c->tty_wait_item);
+			evtimer_set(&c->tty_wait_timer,
+			    server_client_tty_wait_timeout, c);
+			evtimer_add(&c->tty_wait_timer, &tv);
+		}
+	}
+
+	if (c->flags & CLIENT_CONTROL) {
+		if (c->fd != -1)
+			control_start(c);
+	} else if (c->fd != -1) {
 		if (tty_init(&c->tty, c) != 0) {
-			close(c->fd);
+			closesocket((SOCKET)c->fd);
 			c->fd = -1;
 		} else {
 			tty_resize(&c->tty);

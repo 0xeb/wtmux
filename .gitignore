@@ -25,3 +25,9 @@ regress/logs/
 tags
 tmux
 tmux.1.*
+
+# Windows (CMake) builds.
+/out/
+/build*/
+/CMakeUserPresets.json
+.vs/

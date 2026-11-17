@@ -968,7 +968,8 @@ window_panes_draw_screen(struct window_mode_entry *wme)
 }
 
 static void
-window_panes_timer_callback(__unused int fd, __unused short events, void *arg)
+window_panes_timer_callback(__unused evutil_socket_t fd, __unused short events,
+    void *arg)
 {
 	struct window_mode_entry	*wme = arg;
 

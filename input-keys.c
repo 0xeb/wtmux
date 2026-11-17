@@ -394,6 +394,8 @@ input_key_build(void)
 }
 
 /* Translate a key code into an output key sequence for a pane. */
+static void	input_key_write(const char *, struct bufferevent *, const char *,
+		    size_t);
 int
 input_key_pane(struct window_pane *wp, key_code key, struct mouse_event *m)
 {
@@ -406,6 +408,21 @@ input_key_pane(struct window_pane *wp, key_code key, struct mouse_event *m)
 		if (m != NULL && m->wp != -1 && (u_int)m->wp == wp->id)
 			input_key_mouse(wp, m);
 		return (0);
+	}
+	if (wp->win32_pty != NULL && win32_pty_key_records(wp->win32_pty) &&
+	    (key & KEYC_MASK_MODIFIERS) == KEYC_META &&
+	    (~wp->screen->mode & MODE_KEYS_EXTENDED_2) &&
+	    (key & KEYC_MASK_KEY) < 0x80 && (key & KEYC_MASK_KEY) != 0 &&
+	    strchr("PX]^_", (int)(key & KEYC_MASK_KEY)) != NULL) {
+		char	 record[128];
+		size_t	 n;
+
+		n = win32_key_alt_record((u_char)(key & KEYC_MASK_KEY),
+		    record, sizeof record);
+		if (n != 0) {
+			input_key_write(__func__, wp->event, record, n);
+			return (0);
+		}
 	}
 	return (input_key(wp->screen, wp->event, key));
 }
@@ -427,7 +444,7 @@ input_key_extended(struct bufferevent *bev, key_code key)
 {
 	char		 tmp[64], modifier;
 	struct utf8_data ud;
-	wchar_t		 wc;
+	tmux_wchar_t		 wc;
 
 	switch (key & KEYC_MASK_MODIFIERS) {
 	case KEYC_SHIFT:

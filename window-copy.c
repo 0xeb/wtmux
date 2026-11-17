@@ -52,7 +52,7 @@ static void	window_copy_redraw_lines(struct window_mode_entry *, u_int,
 		    u_int);
 static void	window_copy_redraw_screen(struct window_mode_entry *);
 static void	window_copy_do_refresh(struct window_mode_entry *, int);
-static void	window_copy_refresh_timer(int, short, void *);
+static void	window_copy_refresh_timer(evutil_socket_t, short, void *);
 static void	window_copy_refresh_arm(struct window_mode_entry *);
 static int	window_copy_refresh_allowed(struct window_mode_entry *);
 static void	window_copy_refresh_start(struct window_mode_entry *);
@@ -397,7 +397,8 @@ struct window_copy_mode_data {
 };
 
 static void
-window_copy_scroll_timer(__unused int fd, __unused short events, void *arg)
+window_copy_scroll_timer(__unused evutil_socket_t fd, __unused short events,
+    void *arg)
 {
 	struct window_mode_entry	*wme = arg;
 	struct window_pane		*wp = wme->wp;
@@ -3375,7 +3376,8 @@ window_copy_refresh_allowed(struct window_mode_entry *wme)
 }
 
 static void
-window_copy_refresh_timer(__unused int fd, __unused short events, void *arg)
+window_copy_refresh_timer(__unused evutil_socket_t fd, __unused short events,
+    void *arg)
 {
 	struct window_mode_entry	*wme = arg;
 	struct window_pane		*wp = wme->wp;

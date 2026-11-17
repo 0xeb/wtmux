@@ -18,10 +18,8 @@
 
 #include <sys/types.h>
 
-#include <fnmatch.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "tmux.h"
 
@@ -36,7 +34,7 @@ RB_GENERATE_STATIC(environ, environ_entry, entry, environ_cmp);
 static int
 environ_cmp(struct environ_entry *envent1, struct environ_entry *envent2)
 {
-	return (strcmp(envent1->name, envent2->name));
+	return (_stricmp(envent1->name, envent2->name));
 }
 
 /* Initialise the environment. */
@@ -268,12 +266,6 @@ environ_for_session(struct session *s, int no_TERM)
 		environ_set(env, "TERM_PROGRAM_VERSION", 0, "%s", getversion());
 		environ_set(env, "COLORTERM", 0, "truecolor");
 	}
-
-#ifdef HAVE_SYSTEMD
-	environ_clear(env, "LISTEN_PID");
-	environ_clear(env, "LISTEN_FDS");
-	environ_clear(env, "LISTEN_FDNAMES");
-#endif
 
 	if (s != NULL)
 		idx = s->id;

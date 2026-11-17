@@ -20,7 +20,6 @@
 
 #include <ctype.h>
 #include <errno.h>
-#include <glob.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -181,8 +180,7 @@ cmd_source_file_exec(struct cmd *self, struct cmdq_item *item)
 	enum cmd_retval			 retval = CMD_RETURN_NORMAL;
 	char				*pattern, *cwd, *expanded = NULL;
 	const char			*path, *error;
-	glob_t				 g;
-	int				 result, parse_flags;
+	int				 parse_flags;
 	u_int				 i, j;
 
 	if (c == NULL) {
@@ -231,33 +229,26 @@ cmd_source_file_exec(struct cmd *self, struct cmdq_item *item)
 			continue;
 		}
 
-		if (*path == '/')
-			pattern = xstrdup(path);
-		else
-			xasprintf(&pattern, "%s/%s", cwd, path);
-		log_debug("%s: %s", __func__, pattern);
+		{
+			char	**paths;
+			size_t	  count, k;
 
-		if ((result = glob(pattern, 0, NULL, &g)) != 0) {
-			if (result != GLOB_NOMATCH ||
-			    (~cdata->flags & CMD_PARSE_QUIET)) {
-				if (result == GLOB_NOMATCH)
-					error = strerror(ENOENT);
-				else if (result == GLOB_NOSPACE)
-					error = strerror(ENOMEM);
-				else
-					error = strerror(EINVAL);
-				cmdq_error(item, "%s: %s", error, path);
-				retval = CMD_RETURN_ERROR;
+			log_debug("%s: %s", __func__, path);
+			if (win32_glob(server_client_get_cwd(c, NULL), path,
+			    &paths, &count) != 0) {
+				if (~cdata->flags & CMD_PARSE_QUIET) {
+					cmdq_error(item, "%s: %s",
+					    strerror(ENOENT), path);
+					retval = CMD_RETURN_ERROR;
+				}
+				win32_globfree(paths, count);
+				continue;
 			}
-			globfree(&g);
-			free(pattern);
+			for (k = 0; k < count; k++)
+				cmd_source_file_add(cdata, paths[k]);
+			win32_globfree(paths, count);
 			continue;
 		}
-		free(pattern);
-
-		for (j = 0; j < g.gl_pathc; j++)
-			cmd_source_file_add(cdata, g.gl_pathv[j]);
-		globfree(&g);
 	}
 	free(expanded);
 

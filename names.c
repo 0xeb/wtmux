@@ -19,19 +19,19 @@
 #include <sys/types.h>
 
 #include <ctype.h>
-#include <libgen.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "tmux.h"
 
-static void	 name_time_callback(int, short, void *);
+static void	 name_time_callback(evutil_socket_t, short, void *);
 static int	 name_time_expired(struct window *, struct timeval *);
 
 static char	*format_window_name(struct window *);
 
 static void
-name_time_callback(__unused int fd, __unused short events, void *arg)
+name_time_callback(__unused evutil_socket_t fd, __unused short events,
+    void *arg)
 {
 	struct window	*w = arg;
 
@@ -153,6 +153,17 @@ parse_window_name(const char *in)
 
 	while (*name == ' ' || *name == '-')
 		name++;
+	{
+		char	*p;
+
+		for (p = name; *p != '\0'; p++) {
+			if (strncasecmp(p, ".exe", 4) == 0 &&
+			    (p[4] == '\0' || p[4] == ' ')) {
+				p[4] = '\0';
+				break;
+			}
+		}
+	}
 	if ((ptr = strchr(name, ' ')) != NULL)
 		*ptr = '\0';
 
@@ -164,8 +175,19 @@ parse_window_name(const char *in)
 			*ptr-- = '\0';
 	}
 
-	if (*name == '/')
-		name = basename(name);
+	{
+		char	*slash = strrchr(name, '/');
+		char	*bslash = strrchr(name, '\\');
+		size_t	 n;
+
+		if (bslash != NULL && (slash == NULL || bslash > slash))
+			slash = bslash;
+		if (slash != NULL && slash[1] != '\0')
+			name = slash + 1;
+		n = strlen(name);
+		if (n > 4 && strcasecmp(name + n - 4, ".exe") == 0)
+			name[n - 4] = '\0';
+	}
 	name = clean_name(name, 0);
 	free(copy);
 	if (name == NULL)

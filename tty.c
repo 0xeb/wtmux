@@ -17,27 +17,20 @@
  */
 
 #include <sys/types.h>
-#include <sys/ioctl.h>
 
-#include <netinet/in.h>
-
-#include <curses.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <resolv.h>
 #include <stdlib.h>
 #include <string.h>
-#include <termios.h>
 #include <time.h>
-#include <unistd.h>
 
 #include "tmux.h"
 
 static int	tty_log_fd = -1;
 
-static void	tty_start_timer_callback(int, short, void *);
+static void	tty_start_timer_callback(evutil_socket_t, short, void *);
 static void	tty_start_start_timer(struct tty *);
-static void	tty_clipboard_query_callback(int, short, void *);
+static void	tty_clipboard_query_callback(evutil_socket_t, short, void *);
 static void	tty_send_size_query(struct tty *, int);
 static void	tty_set_italics(struct tty *);
 static int	tty_try_colour(struct tty *, int, const char *);
@@ -101,8 +94,6 @@ tty_create_log(void)
 int
 tty_init(struct tty *tty, struct client *c)
 {
-	if (!isatty(c->fd))
-		return (-1);
 
 	memset(tty, 0, sizeof *tty);
 	tty->client = c;
@@ -112,8 +103,8 @@ tty_init(struct tty *tty, struct client *c)
 	tty->fg = tty->bg = -1;
 	tty->mouse_last_pane = -1;
 
-	if (tcgetattr(c->fd, &tty->tio) != 0)
-		return (-1);
+	memset(&tty->tio, 0, sizeof tty->tio);
+	tty->tio.c_cc[VERASE] = '\177';
 	return (0);
 }
 
@@ -130,38 +121,19 @@ tty_send_size_query(struct tty *tty, int apply)
 void
 tty_resize(struct tty *tty)
 {
-	struct client	*c = tty->client;
-	struct winsize	 ws;
-	u_int		 sx, sy, xpixel, ypixel;
+	tty_resize_client(tty, tty->sx == 0 ? 80 : tty->sx,
+	    tty->sy == 0 ? 24 : tty->sy);
+	return;
+}
 
-	if (ioctl(c->fd, TIOCGWINSZ, &ws) != -1) {
-		sx = ws.ws_col;
-		if (sx == 0) {
-			sx = 80;
-			xpixel = 0;
-		} else
-			xpixel = ws.ws_xpixel / sx;
-		sy = ws.ws_row;
-		if (sy == 0) {
-			sy = 24;
-			ypixel = 0;
-		} else
-			ypixel = ws.ws_ypixel / sy;
-
-		if ((xpixel == 0 || ypixel == 0) &&
-		    (tty->flags & TTY_STARTED) &&
-		    !(tty->flags & (TTY_WINSZQUERY|TTY_WINSZPIXELS)) &&
-		    (tty->term->flags & TERM_VT100LIKE))
-			tty_send_size_query(tty, 0);
-	} else {
-		sx = 80;
-		sy = 24;
-		xpixel = 0;
-		ypixel = 0;
-	}
-	log_debug("%s: %s now %ux%u (%ux%u)", __func__, c->name, sx, sy,
-	    xpixel, ypixel);
-	tty_set_size(tty, sx, sy, xpixel, ypixel);
+void
+tty_resize_client(struct tty *tty, u_int sx, u_int sy)
+{
+	tty_set_size(tty, sx, sy, 0, 0);
+	if ((tty->flags & TTY_STARTED) &&
+	    !(tty->flags & (TTY_WINSZQUERY|TTY_WINSZPIXELS)) &&
+	    (tty->term->flags & TERM_VT100LIKE))
+		tty_send_size_query(tty, 0);
 	tty_invalidate(tty);
 }
 
@@ -184,13 +156,17 @@ tty_set_size(struct tty *tty, u_int sx, u_int sy, u_int xpixel, u_int ypixel)
 }
 
 static void
-tty_read_callback(__unused int fd, __unused short events, void *data)
+tty_read_callback(__unused evutil_socket_t fd, __unused short events,
+    void *data)
 {
 	struct tty	*tty = data;
 	struct client	*c = tty->client;
 	const char	*name = c->name;
 	size_t		 size = EVBUFFER_LENGTH(tty->in);
 	int		 nread;
+
+	if (c->flags & CLIENT_DEAD)
+		return;
 
 	nread = evbuffer_read(tty->in, c->fd, -1);
 	if (nread == 0 || nread == -1) {
@@ -209,7 +185,8 @@ tty_read_callback(__unused int fd, __unused short events, void *data)
 }
 
 static void
-tty_timer_callback(__unused int fd, __unused short events, void *data)
+tty_timer_callback(__unused evutil_socket_t fd, __unused short events,
+    void *data)
 {
 	struct tty	*tty = data;
 	struct client	*c = tty->client;
@@ -259,7 +236,8 @@ tty_block_maybe(struct tty *tty)
 }
 
 static void
-tty_write_callback(__unused int fd, __unused short events, void *data)
+tty_write_callback(__unused evutil_socket_t fd, __unused short events,
+    void *data)
 {
 	struct tty	*tty = data;
 	struct client	*c = tty->client;
@@ -326,7 +304,8 @@ tty_open(struct tty *tty, char **cause)
 }
 
 static void
-tty_start_timer_callback(__unused int fd, __unused short events, void *data)
+tty_start_timer_callback(__unused evutil_socket_t fd, __unused short events,
+    void *data)
 {
 	struct tty	*tty = data;
 	struct client	*c = tty->client;
@@ -358,22 +337,12 @@ void
 tty_start_tty(struct tty *tty)
 {
 	struct client	*c = tty->client;
-	struct termios	 tio;
 	u_int		 i;
 
 	setblocking(c->fd, 0);
 	event_add(&tty->event_in, NULL);
 
-	memcpy(&tio, &tty->tio, sizeof tio);
-	tio.c_iflag &= ~(IXON|IXOFF|ICRNL|INLCR|IGNCR|IMAXBEL|ISTRIP);
-	tio.c_iflag |= IGNBRK;
-	tio.c_oflag &= ~(OPOST|ONLCR|OCRNL|ONLRET);
-	tio.c_lflag &= ~(IEXTEN|ICANON|ECHO|ECHOE|ECHONL|ECHOCTL|ECHOPRT|
-	    ECHOKE|ISIG);
-	tio.c_cc[VMIN] = 1;
-	tio.c_cc[VTIME] = 0;
-	if (tcsetattr(c->fd, TCSANOW, &tio) == 0)
-		tcflush(c->fd, TCOFLUSH);
+	win32_tty_raw_mode();
 
 	if (options_get_number(global_options, "clear-on-attach")) {
 		tty_putcode(tty, TTYC_SMCUP);
@@ -488,7 +457,6 @@ void
 tty_stop_tty(struct tty *tty)
 {
 	struct client	*c = tty->client;
-	struct winsize	 ws;
 
 	if (!(tty->flags & TTY_STARTED))
 		return;
@@ -509,12 +477,8 @@ tty_stop_tty(struct tty *tty)
 	 * because the fd is invalid. Things like ssh -t can easily leave us
 	 * with a dead tty.
 	 */
-	if (ioctl(c->fd, TIOCGWINSZ, &ws) == -1)
-		return;
-	if (tcsetattr(c->fd, TCSANOW, &tty->tio) == -1)
-		return;
-
-	tty_raw(tty, tty_term_string_ii(tty->term, TTYC_CSR, 0, ws.ws_row - 1));
+	win32_tty_restore();
+	tty_raw(tty, tty_term_string_ii(tty->term, TTYC_CSR, 0, tty->sy - 1));
 	if (tty_acs_needed(tty))
 		tty_raw(tty, tty_term_string(tty->term, TTYC_RMACS));
 	tty_raw(tty, tty_term_string(tty->term, TTYC_SGR0));
@@ -627,15 +591,18 @@ tty_raw(struct tty *tty, const char *s)
 	ssize_t		 n, slen;
 	u_int		 i;
 
+	if (c->fd == -1)
+		return;
+
 	slen = strlen(s);
 	for (i = 0; i < 5; i++) {
-		n = write(c->fd, s, slen);
-		if (n >= 0) {
+		n = send((SOCKET)c->fd, s, (int)slen, 0);
+		if (n != SOCKET_ERROR) {
 			s += n;
 			slen -= n;
 			if (slen == 0)
 				break;
-		} else if (n == -1 && errno != EAGAIN)
+		} else if (WSAGetLastError() != WSAEWOULDBLOCK)
 			break;
 		usleep(100);
 	}
@@ -3036,7 +3003,8 @@ tty_default_attributes(struct tty *tty, u_int bg,
 }
 
 static void
-tty_clipboard_query_callback(__unused int fd, __unused short events, void *data)
+tty_clipboard_query_callback(__unused evutil_socket_t fd, __unused short events,
+    void *data)
 {
 	struct tty	*tty = data;
 

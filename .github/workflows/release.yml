@@ -1,0 +1,110 @@
+# Builds the Windows release zips. A tag v<version> (the version in
+# CMakeLists.txt's project()) builds x64, x86 and ARM64 and drafts a GitHub
+# release with the zips, SHA256SUMS.txt and wtmux-<version>-release.json; the
+# draft is reviewed and published by hand. Running the workflow by hand only
+# builds, and keeps the zips as workflow artifacts.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            msvc: amd64
+          - arch: x86
+            msvc: amd64_x86
+          - arch: arm64
+            msvc: amd64_arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: ${{ matrix.msvc }}
+
+      - name: vcpkg at the manifest's baseline
+        shell: pwsh
+        run: |
+          $baseline = (Get-Content -Raw vcpkg.json | ConvertFrom-Json).'builtin-baseline'
+          $vcpkg = Join-Path $env:RUNNER_TEMP 'vcpkg'
+          $cache = Join-Path $env:RUNNER_TEMP 'vcpkg-cache'
+          git clone --quiet https://github.com/microsoft/vcpkg.git $vcpkg
+          if ($LASTEXITCODE) { exit 1 }
+          git -C $vcpkg checkout --quiet $baseline
+          if ($LASTEXITCODE) { exit 1 }
+          & (Join-Path $vcpkg 'bootstrap-vcpkg.bat') -disableMetrics
+          if ($LASTEXITCODE) { exit 1 }
+          New-Item -ItemType Directory -Force $cache | Out-Null
+          "VCPKG_ROOT=$vcpkg" >> $env:GITHUB_ENV
+          "VCPKG_BINARY_SOURCES=clear;files,$cache,readwrite" >> $env:GITHUB_ENV
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/vcpkg-cache
+          key: vcpkg-${{ matrix.arch }}-${{ hashFiles('vcpkg.json') }}
+
+      - name: build and package
+        shell: pwsh
+        run: .github/release/build.ps1 -Arch ${{ matrix.arch }} -OutDir dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wtmux-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: windows-2025
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: wtmux-*
+          merge-multiple: true
+          path: dist
+
+      - name: checksums, release.json and notes
+        shell: pwsh
+        run: .github/release/finish.ps1 -InDir dist -OutDir release
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release/*.zip
+
+      - name: draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $assets = @(Get-ChildItem release -File | Where-Object Name -ne 'release-notes.md' | ForEach-Object FullName)
+          gh release create $env:GITHUB_REF_NAME --draft --verify-tag --title "wtmux $version" --notes-file release/release-notes.md @assets
+          if ($LASTEXITCODE) { exit 1 }

@@ -17,24 +17,10 @@
  */
 
 #include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/uio.h>
-#include <sys/utsname.h>
 
 #include <errno.h>
-#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-
-#if defined(HAVE_NCURSES_H)
-#include <ncurses.h>
-#endif
-
-#ifdef HAVE_JEMALLOC
-#define JEMALLOC_MANGLE
-#include <jemalloc/jemalloc.h>
-#endif
 
 #include "tmux.h"
 
@@ -77,7 +63,7 @@ static int	peer_check_version(struct tmuxpeer *, struct imsg *);
 static void	proc_update_event(struct tmuxpeer *);
 
 static void
-proc_event_cb(__unused int fd, short events, void *arg)
+proc_event_cb(__unused evutil_socket_t fd, short events, void *arg)
 {
 	struct tmuxpeer	*peer = arg;
 	int		 n;
@@ -123,11 +109,12 @@ proc_event_cb(__unused int fd, short events, void *arg)
 }
 
 static void
-proc_signal_cb(int signo, __unused short events, void *arg)
+proc_signal_cb(evutil_socket_t signo, __unused short events, void *arg)
 {
 	struct tmuxproc	*tp = arg;
 
-	tp->signalcb(signo);
+	(void)signo;
+	win32_signal_dispatch();
 }
 
 static int
@@ -186,10 +173,6 @@ proc_start(const char *name)
 {
 	struct tmuxproc	*tp;
 	struct utsname	 u;
-#ifdef HAVE_JEMALLOC
-	const char	*version;
-	size_t		 size = sizeof version;
-#endif
 
 	log_open(name);
 	setproctitle("%s (%s)", name, socket_path);
@@ -200,14 +183,10 @@ proc_start(const char *name)
 	log_debug("%s started (%ld): version %s, socket %s, protocol %d", name,
 	    (long)getpid(), getversion(), socket_path, PROTOCOL_VERSION);
 	log_debug("on %s %s %s", u.sysname, u.release, u.version);
-	log_debug("using libevent %s %s", event_get_version(), event_get_method());
+	log_debug("using libevent %s %s", event_get_version(),
+	    event_get_method());
 #ifdef HAVE_UTF8PROC
 	log_debug("using utf8proc %s", utf8proc_version());
-#endif
-#ifdef HAVE_JEMALLOC
-	if (mallctl("version", &version, &size, NULL, 0) != 0)
-		version = "(unknown version)";
-	log_debug("using jemalloc %s", version);
 #endif
 #ifdef NCURSES_VERSION
 	log_debug("using ncurses %s %06u", NCURSES_VERSION, NCURSES_VERSION_PATCH);
@@ -243,72 +222,27 @@ proc_exit(struct tmuxproc *tp)
 void
 proc_set_signals(struct tmuxproc *tp, void (*signalcb)(int))
 {
-	struct sigaction	sa;
-
 	tp->signalcb = signalcb;
+	win32_signal_init();
+	win32_signal_set_callback(signalcb);
 
-	memset(&sa, 0, sizeof sa);
-	sigemptyset(&sa.sa_mask);
-	sa.sa_flags = SA_RESTART;
-	sa.sa_handler = SIG_IGN;
-
-	sigaction(SIGPIPE, &sa, NULL);
-	sigaction(SIGTSTP, &sa, NULL);
-	sigaction(SIGTTIN, &sa, NULL);
-	sigaction(SIGTTOU, &sa, NULL);
-	sigaction(SIGQUIT, &sa, NULL);
-
-	signal_set(&tp->ev_sigint, SIGINT, proc_signal_cb, tp);
-	signal_add(&tp->ev_sigint, NULL);
-	signal_set(&tp->ev_sighup, SIGHUP, proc_signal_cb, tp);
-	signal_add(&tp->ev_sighup, NULL);
-	signal_set(&tp->ev_sigchld, SIGCHLD, proc_signal_cb, tp);
-	signal_add(&tp->ev_sigchld, NULL);
-	signal_set(&tp->ev_sigcont, SIGCONT, proc_signal_cb, tp);
-	signal_add(&tp->ev_sigcont, NULL);
-	signal_set(&tp->ev_sigterm, SIGTERM, proc_signal_cb, tp);
-	signal_add(&tp->ev_sigterm, NULL);
-	signal_set(&tp->ev_sigusr1, SIGUSR1, proc_signal_cb, tp);
-	signal_add(&tp->ev_sigusr1, NULL);
-	signal_set(&tp->ev_sigusr2, SIGUSR2, proc_signal_cb, tp);
-	signal_add(&tp->ev_sigusr2, NULL);
-	signal_set(&tp->ev_sigwinch, SIGWINCH, proc_signal_cb, tp);
-	signal_add(&tp->ev_sigwinch, NULL);
+	{
+		int sigfd = win32_signal_get_fd();
+		if (sigfd >= 0) {
+			event_set(&tp->ev_sigint, sigfd, EV_READ|EV_PERSIST,
+			    proc_signal_cb, tp);
+			event_add(&tp->ev_sigint, NULL);
+		}
+	}
 }
 
 void
 proc_clear_signals(struct tmuxproc *tp, int defaults)
 {
-	struct sigaction	sa;
-
-	memset(&sa, 0, sizeof sa);
-	sigemptyset(&sa.sa_mask);
-	sa.sa_flags = SA_RESTART;
-	sa.sa_handler = SIG_DFL;
-
-	sigaction(SIGPIPE, &sa, NULL);
-	sigaction(SIGTSTP, &sa, NULL);
-
-	signal_del(&tp->ev_sigint);
-	signal_del(&tp->ev_sighup);
-	signal_del(&tp->ev_sigchld);
-	signal_del(&tp->ev_sigcont);
-	signal_del(&tp->ev_sigterm);
-	signal_del(&tp->ev_sigusr1);
-	signal_del(&tp->ev_sigusr2);
-	signal_del(&tp->ev_sigwinch);
-
-	if (defaults) {
-		sigaction(SIGINT, &sa, NULL);
-		sigaction(SIGQUIT, &sa, NULL);
-		sigaction(SIGHUP, &sa, NULL);
-		sigaction(SIGCHLD, &sa, NULL);
-		sigaction(SIGCONT, &sa, NULL);
-		sigaction(SIGTERM, &sa, NULL);
-		sigaction(SIGUSR1, &sa, NULL);
-		sigaction(SIGUSR2, &sa, NULL);
-		sigaction(SIGWINCH, &sa, NULL);
-	}
+	(void)defaults;
+	if (event_initialized(&tp->ev_sigint))
+		event_del(&tp->ev_sigint);
+	win32_signal_cleanup();
 }
 
 struct tmuxpeer *
@@ -349,7 +283,7 @@ proc_remove_peer(struct tmuxpeer *peer)
 	event_del(&peer->event);
 	imsgbuf_clear(&peer->ibuf);
 
-	close(peer->ibuf.fd);
+	closesocket((SOCKET)peer->ibuf.fd);
 	free(peer);
 }
 
@@ -374,25 +308,37 @@ proc_toggle_log(struct tmuxproc *tp)
 pid_t
 proc_fork_and_daemon(int *fd)
 {
-	pid_t	pid;
-	int	pair[2];
+	int		 pair[2];
+	wchar_t		 cmd[MAX_PATH + 256];
+	wchar_t		 exepath[MAX_PATH];
+	STARTUPINFOW	 si;
+	PROCESS_INFORMATION pi;
 
-	if (socketpair(AF_UNIX, SOCK_STREAM, PF_UNSPEC, pair) != 0)
+	if (win32_socketpair(AF_INET, SOCK_STREAM, 0, pair) != 0)
 		fatal("socketpair failed");
-	switch (pid = fork()) {
-	case -1:
-		fatal("fork failed");
-	case 0:
-		close(pair[0]);
-		*fd = pair[1];
-		if (daemon(1, 0) != 0)
-			fatal("daemon failed");
-		return (0);
-	default:
-		close(pair[1]);
-		*fd = pair[0];
-		return (pid);
+
+	GetModuleFileNameW(NULL, exepath, MAX_PATH);
+
+	_snwprintf_s(cmd, MAX_PATH + 256, _TRUNCATE, L"\"%ls\" -D", exepath);
+
+	memset(&si, 0, sizeof si);
+	si.cb = sizeof si;
+	memset(&pi, 0, sizeof pi);
+
+	if (!CreateProcessW(NULL, cmd, NULL, NULL, TRUE,
+	    DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+	    NULL, NULL, &si, &pi)) {
+		closesocket((SOCKET)pair[0]);
+		closesocket((SOCKET)pair[1]);
+		fatal("CreateProcess failed");
 	}
+
+	CloseHandle(pi.hThread);
+	CloseHandle(pi.hProcess);
+
+	closesocket((SOCKET)pair[1]);
+	*fd = pair[0];
+	return ((pid_t)pi.dwProcessId);
 }
 
 uid_t

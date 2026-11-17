@@ -23,9 +23,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
+#include <io.h>
 
 #include "tmux.h"
+
+#define file_close(fd) win32_close_any(fd)
 
 /*
  * IPC file handling. Both client and server use the same data structures
@@ -52,8 +54,14 @@ file_get_path(struct client *c, const char *file)
 			home = "";
 		xasprintf(&path, "%s%s", home, file + 1);
 	}
-	if (*path == '/')
+	if (path_is_absolute(path))
 		return (path);
+	if (*path != '\0' && (path[1] == ':' ||
+	    (path[1] == '\\' && path[2] == ':'))) {
+		if (path[1] == '\\' && path[2] == ':')
+			memmove(path + 1, path + 2, strlen(path + 2) + 1);
+		return (path);
+	}
 	xasprintf(&full_path, "%s/%s", server_client_get_cwd(c, NULL), path);
 	free(path);
 	return (full_path);
@@ -153,7 +161,7 @@ file_free(struct client_file *cf)
 
 /* Event to fire the done callback. */
 static void
-file_fire_done_cb(__unused int fd, __unused short events, void *arg)
+file_fire_done_cb(__unused evutil_socket_t fd, __unused short events, void *arg)
 {
 	struct client_file	*cf = arg;
 	struct client		*c = cf->c;
@@ -461,7 +469,7 @@ file_cancel(struct client_file *cf)
 
 /* Push event, fired if there is more writing to be done. */
 static void
-file_push_cb(__unused int fd, __unused short events, void *arg)
+file_push_cb(__unused evutil_socket_t fd, __unused short events, void *arg)
 {
 	struct client_file	*cf = arg;
 
@@ -539,7 +547,7 @@ file_write_finished(struct client_file *cf)
 		cf->event = NULL;
 	}
 	if (cf->fd != -1) {
-		if (close(cf->fd) != 0 && cf->error == 0)
+		if (file_close(cf->fd) != 0 && cf->error == 0)
 			cf->error = errno;
 		cf->fd = -1;
 	}
@@ -574,7 +582,7 @@ file_write_error_callback(__unused struct bufferevent *bev, short what,
 	bufferevent_free(cf->event);
 	cf->event = NULL;
 
-	close(cf->fd);
+	file_close(cf->fd);
 	cf->fd = -1;
 
 	if (cf->closed)
@@ -608,7 +616,7 @@ file_write_open(struct client_files *files, struct tmuxpeer *peer,
 	const char		*path;
 	struct msg_write_ready	 reply;
 	struct client_file	 find, *cf;
-	const int		 flags = O_NONBLOCK|O_WRONLY|O_CREAT;
+	const int		 flags = O_BINARY|O_WRONLY|O_CREAT;
 	int			 error = 0;
 
 	if (msglen < sizeof *msg)
@@ -648,6 +656,14 @@ file_write_open(struct client_files *files, struct tmuxpeer *peer,
 		goto reply;
 	}
 
+	if (msg->fd == STDOUT_FILENO || msg->fd == STDERR_FILENO) {
+		cf->event = NULL;
+		goto reply;
+	}
+	if ((cf->fd = win32_fd_bridge(cf->fd, 1)) == -1) {
+		error = EIO;
+		goto reply;
+	}
 	cf->event = bufferevent_new(cf->fd, NULL, file_write_callback,
 	    file_write_error_callback, cf);
 	if (cf->event == NULL)
@@ -679,6 +695,9 @@ file_write_data(struct client_files *files, struct imsg *imsg)
 
 	if (cf->event != NULL)
 		bufferevent_write(cf->event, msg + 1, size);
+	else if (cf->fd != -1) {
+		_write(cf->fd, msg + 1, (unsigned int)size);
+	}
 }
 
 /* Handle a file write close message (client). */
@@ -717,7 +736,7 @@ file_read_error_callback(__unused struct bufferevent *bev, short what,
 	proc_send(cf->peer, MSG_READ_DONE, -1, &msg, sizeof msg);
 
 	bufferevent_free(cf->event);
-	close(cf->fd);
+	file_close(cf->fd);
 	RB_REMOVE(client_files, cf->tree, cf);
 	file_free(cf);
 }
@@ -765,7 +784,7 @@ file_read_open(struct client_files *files, struct tmuxpeer *peer,
 	const char		*path;
 	struct msg_read_done	 reply;
 	struct client_file	 find, *cf;
-	const int		 flags = O_NONBLOCK|O_RDONLY;
+	const int		 flags = O_BINARY|O_RDONLY;
 	int			 error;
 
 	if (msglen < sizeof *msg)
@@ -805,6 +824,10 @@ file_read_open(struct client_files *files, struct tmuxpeer *peer,
 		goto reply;
 	}
 
+	if ((cf->fd = win32_fd_bridge(cf->fd, 0)) == -1) {
+		error = EIO;
+		goto reply;
+	}
 	cf->event = bufferevent_new(cf->fd, file_read_callback, NULL,
 	    file_read_error_callback, cf);
 	if (cf->event == NULL)

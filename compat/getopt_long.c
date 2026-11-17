@@ -92,12 +92,6 @@
 #define required_argument  1
 #define optional_argument  2
 
-#if !defined(HAVE_GETOPT) || !defined(HAVE_GETOPT_OPTRESET)
-
-#if 0
-#include <err.h>
-#include <getopt.h>
-#endif
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -546,32 +540,3 @@ getopt(int nargc, char * const *nargv, const char *options)
 	return (getopt_internal(nargc, nargv, options, NULL, NULL, 0));
 }
 
-#if 0
-/*
- * getopt_long --
- *	Parse argc/argv argument vector.
- */
-int
-getopt_long(int nargc, char * const *nargv, const char *options,
-    const struct option *long_options, int *idx)
-{
-
-	return (getopt_internal(nargc, nargv, options, long_options, idx,
-	    FLAG_PERMUTE));
-}
-
-/*
- * getopt_long_only --
- *	Parse argc/argv argument vector.
- */
-int
-getopt_long_only(int nargc, char * const *nargv, const char *options,
-    const struct option *long_options, int *idx)
-{
-
-	return (getopt_internal(nargc, nargv, options, long_options, idx,
-	    FLAG_PERMUTE|FLAG_LONGONLY));
-}
-#endif
-
-#endif /* !defined(HAVE_GETOPT) || !defined(HAVE_OPTRESET) */

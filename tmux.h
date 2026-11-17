@@ -19,20 +19,11 @@
 #ifndef TMUX_H
 #define TMUX_H
 
-#include <sys/types.h>
-#include <sys/time.h>
-#include <sys/uio.h>
-
 #include <limits.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
-#include <termios.h>
 #include <wchar.h>
-
-#ifdef HAVE_UTEMPTER
-#include <utempter.h>
-#endif
 
 #include "compat.h"
 #include "tmux-image.h"
@@ -387,6 +378,9 @@ enum {
 };
 
 /* Special key codes. */
+#if !defined(TMUX_KEYC_ENUM)
+#include "tmux-keyc.h"
+#else
 enum {
 	/* User key code range. */
 	KEYC_USER = KEYC_SHIFT_TYPE(KEYC_TYPE_USER),
@@ -486,6 +480,7 @@ enum {
 	KEYC_MOUSE_KEYS(DOUBLECLICK),
 	KEYC_MOUSE_KEYS(TRIPLECLICK),
 };
+#endif
 
 /* Termcap codes. */
 enum tty_code_code {
@@ -1443,6 +1438,9 @@ struct window_pane {
 	char		*program_state;
 	char		*program_name;
 	char		*program_message;
+	void		*win32_pty;
+	void		*win32_pipe_child;
+	char		*win32_cwd;
 
 	struct grid_cell cached_gc;
 	struct grid_cell cached_active_gc;
@@ -2349,6 +2347,9 @@ struct client {
 	u_int			 term_ncaps;
 
 	char			*ttyname;
+	char			*tty_token;
+	struct event		 tty_wait_timer;
+	struct cmdq_item	*tty_wait_item;
 	struct tty		 tty;
 
 	size_t			 written;
@@ -2682,6 +2683,7 @@ struct sort_criteria {
 };
 
 /* tmux.c */
+int		 path_is_absolute(const char *);
 extern struct options	*global_options;
 extern struct options	*global_s_options;
 extern struct options	*global_w_options;
@@ -2987,6 +2989,7 @@ extern const struct options_table_entry	options_table[];
 extern const struct options_name_map	options_other_names[];
 
 /* job.c */
+char	*environ_to_win32_block(struct environ *);
 typedef void (*job_update_cb) (struct job *);
 typedef void (*job_complete_cb) (struct job *);
 typedef void (*job_free_cb) (void *);
@@ -3060,6 +3063,7 @@ void	tty_cell(struct tty *, const struct grid_cell *,
 	    const struct tty_style_ctx *);
 int	tty_init(struct tty *, struct client *);
 void	tty_resize(struct tty *);
+void	tty_resize_client(struct tty *, u_int, u_int);
 int	tty_set_size(struct tty *, u_int, u_int, u_int, u_int);
 void	tty_size_query(struct tty *);
 void	tty_invalidate(struct tty *);
@@ -3417,9 +3421,12 @@ int	 server_check_marked(void);
 int	 server_start(struct tmuxproc *, uint64_t, struct event_base *, int,
 	     char *);
 void	 server_update_socket(void);
+void	 server_launcher_arrived(pid_t);
 void	 server_add_accept(int);
 void printflike(1, 2) server_add_message(const char *, ...);
 int	 server_create_socket(uint64_t, char **);
+void	 server_add_pending_tty(const char *, int);
+int	 server_get_pending_tty(const char *);
 
 /* server-client.c */
 extern struct clients dead_clients;
@@ -3725,6 +3732,7 @@ void	 screen_write_start_sync(struct window_pane *);
 void	 screen_write_stop_sync(struct window_pane *);
 void	 screen_write_end_sync(struct screen_write_ctx *);
 void	 screen_write_sync_clear_dirty(struct window_pane *);
+int	 screen_write_sync_defer(struct screen_write_ctx *, u_int, u_int);
 void	 screen_write_cursorup(struct screen_write_ctx *, u_int);
 void	 screen_write_cursordown(struct screen_write_ctx *, u_int);
 void	 screen_write_cursorright(struct screen_write_ctx *, u_int);
@@ -3807,6 +3815,7 @@ const char *screen_mode_to_string(int);
 const char *screen_print(struct screen *, int);
 
 /* window.c */
+void	 window_pane_close_pipe(struct window_pane *);
 extern struct windows windows;
 extern struct window_pane_tree all_window_panes;
 int		 window_cmp(struct window *, struct window *);
@@ -4239,8 +4248,8 @@ void		 session_theme_changed(struct session *);
 void		 session_update_history(struct session *);
 
 /* utf8.c */
-enum utf8_state	 utf8_towc (const struct utf8_data *, wchar_t *);
-enum utf8_state	 utf8_fromwc(wchar_t wc, struct utf8_data *);
+enum utf8_state	 utf8_towc (const struct utf8_data *, tmux_wchar_t *);
+enum utf8_state	 utf8_fromwc(tmux_wchar_t wc, struct utf8_data *);
 int		 utf8_has_whitespace(const struct utf8_data *);
 void		 utf8_update_width_cache(void);
 utf8_char	 utf8_build_one(u_char);
@@ -4268,6 +4277,7 @@ int		 utf8_cstrhas(const char *, const struct utf8_data *);
 char		*osdep_get_name(int, char *);
 char		*osdep_get_cwd(int);
 struct event_base *osdep_event_init(void);
+int		 win32_pane_report_cwd(struct window_pane *, const char *, int);
 
 /* utf8-combined.c */
 int		 utf8_has_zwj(const struct utf8_data *);
